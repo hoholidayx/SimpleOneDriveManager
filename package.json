@@ -1,0 +1,48 @@
+{
+  "name": "simple-onedrive-manager",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "dev": "node scripts/setup.mjs && concurrently -k -n api,web \"APP_ORIGIN=http://localhost:5173 tsx watch server/index.ts\" \"vite\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json",
+    "build": "npm run typecheck && vite build && tsc -p tsconfig.server.json",
+    "test": "vitest run",
+    "start": "node scripts/service.mjs start",
+    "stop": "node scripts/service.mjs stop",
+    "restart": "node scripts/service.mjs restart",
+    "status": "node scripts/service.mjs status",
+    "browser:start": "node scripts/browser-service.mjs start",
+    "browser:stop": "node scripts/browser-service.mjs stop",
+    "browser:restart": "node scripts/browser-service.mjs restart",
+    "browser:status": "node scripts/browser-service.mjs status",
+    "test:browser": "node tests/image-preview.browser.mjs",
+    "check:secrets": "node scripts/check-secrets.mjs"
+  },
+  "dependencies": {
+    "@ant-design/icons": "^6.1.0",
+    "@azure/msal-node": "^7.1.1",
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/static": "^10.1.7",
+    "antd": "^6.6.7",
+    "fastify": "^5.12.7",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^9.2.1",
+    "playwright": "^1.64.1",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.5",
+    "vitest": "^4.0.0"
+  }
+}

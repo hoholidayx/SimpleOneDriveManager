@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ODM_BROWSER_CHANNEL: chromium
+      ODM_BROWSER_TEST_PORT: 3101
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run check:secrets
+      - run: npm test
+      - run: npm run build
+      - run: npm run check:secrets -- --include-build
+      - run: npm audit --omit=dev
+      - run: npx playwright install --with-deps chromium
+      - run: npm run browser:start
+      - run: npm run test:browser
+      - if: always()
+        run: npm run browser:stop
