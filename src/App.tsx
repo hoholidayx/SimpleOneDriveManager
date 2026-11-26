@@ -11,6 +11,7 @@ import { useUploads } from './useUploads';
 import { imageMime } from '../shared/images';
 import { FileGrid } from './components/FileGrid';
 import { ImagePreview } from './components/ImagePreview';
+import { AccountConnections } from './components/AccountConnections';
 
 type Nav = 'files' | 'transfers' | 'settings';
 type BatchReport = { action: 'move' | 'delete'; items: DriveItem[]; results: BatchResult[]; parentId?: string };
@@ -49,6 +50,7 @@ export default function App() {
   const [batchBusy, setBatchBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [switching, setSwitching] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const replaceInput = useRef<HTMLInputElement>(null);
   const resumeInput = useRef<HTMLInputElement>(null);
@@ -91,8 +93,10 @@ export default function App() {
     const error = new URLSearchParams(window.location.search).get('authError');
     if (error) { message.error(error, 8); window.history.replaceState({}, '', window.location.pathname); }
     const listener = () => setReauth(true);
+    const changed = () => window.location.reload();
     window.addEventListener('odm-auth-required', listener);
-    return () => window.removeEventListener('odm-auth-required', listener);
+    window.addEventListener('odm-account-changed', changed);
+    return () => { window.removeEventListener('odm-auth-required', listener); window.removeEventListener('odm-account-changed', changed); };
   }, []);
   useEffect(() => {
     if (!connected) return;
@@ -119,7 +123,7 @@ export default function App() {
   }
   function download(item: DriveItem) {
     const link = document.createElement('a');
-    link.href = `/api/items/${pathId(item.id)}/download`; link.download = item.name; link.target = '_blank'; link.rel = 'noopener'; link.click();
+    link.href = `/api/items/${pathId(item.id)}/download?accountId=${pathId(status!.account!.id)}`; link.download = item.name; link.target = '_blank'; link.rel = 'noopener'; link.click();
   }
   async function runBatch(action: 'move' | 'delete', targets: DriveItem[], parentId?: string) {
     setBatchBusy(true);
@@ -150,9 +154,26 @@ export default function App() {
     } catch (e) { message.error(friendlyError(e)); }
     finally { setSaving(false); }
   }
+  function addAccount() {
+    if (uploads.busy) { message.info('请先暂停传输，等待当前分片完成后再添加账号'); return; }
+    window.location.assign('/api/auth/login');
+  }
+  async function switchAccount(accountId: string) {
+    if (switching || loggingOut || accountId === status?.account?.id) return;
+    if (uploads.busy) { message.info('请先暂停传输，等待当前分片完成后再切换账号'); return; }
+    setSwitching(true);
+    try {
+      await api('/auth/switch', { method: 'POST', body: json({ accountId }) });
+      window.location.reload();
+    } catch (e) { setSwitching(false); message.error(friendlyError(e)); }
+  }
   async function logout() {
-    if (uploads.busy) { message.info('请先暂停传输，等待当前分片完成后再退出'); return; }
-    modal.confirm({ title: '断开 OneDrive 连接？', content: '将清除本应用的登录和授权缓存，未完成的上传任务也会取消。再次使用时需要重新授权。', okText: '断开连接', cancelText: '取消', onOk: async () => { setLoggingOut(true); try { await api('/auth/logout', { method: 'POST' }); setRoot(null); setFolder(null); setDrive(null); setItems([]); await initialize(); } catch (e) { message.error(friendlyError(e)); } finally { setLoggingOut(false); } } });
+    if (uploads.busy) { message.info('请先暂停传输，等待当前分片完成后再移除授权'); return; }
+    modal.confirm({ title: '移除当前账号授权？', content: '将移除此账号在本应用中的授权、会话关联和上传记录，未完成的上传会取消。其他账号保持连接；OneDrive 云端文件会保留。', okText: '移除授权', cancelText: '取消', onOk: async () => {
+      setLoggingOut(true);
+      try { await api('/auth/logout', { method: 'POST' }); window.location.reload(); }
+      catch (e) { message.error(friendlyError(e)); setLoggingOut(false); }
+    } });
   }
   function rowMenu(item: DriveItem) {
     return { items: [
@@ -191,13 +212,13 @@ export default function App() {
       </div>
     </aside>
     <div className="main-shell">
-      <header className="topbar"><div className="topbar-location"><CloudOutlined /><span>个人云盘</span><span className="topbar-slash">/</span><strong>{nav === 'files' ? '文件管理' : nav === 'transfers' ? '传输任务' : '连接设置'}</strong></div><div className="topbar-account"><Tag bordered={false} color={connected ? 'success' : 'default'}><span className={`status-dot ${connected ? 'online' : ''}`} />{connected ? '已连接' : '未连接'}</Tag>{connected && status?.account ? <Dropdown menu={{ items: [{ key: 'settings', label: '连接设置', icon: <SettingOutlined /> }, { key: 'logout', label: '断开连接', icon: <LogoutOutlined />, danger: true }], onClick: ({ key }) => key === 'logout' ? void logout() : setNav('settings') }}><button className="account-button"><Avatar size={30} style={{ background: '#e8f0ff', color: '#1765e8' }}>{status.account.name.slice(0, 1).toUpperCase()}</Avatar><span>{status.account.name}</span></button></Dropdown> : <Avatar size={30} icon={<CloudOutlined />} style={{ background: '#f0f3f9', color: '#9ca9bf' }} />}</div></header>
+      <header className="topbar"><div className="topbar-location"><CloudOutlined /><span>个人云盘</span><span className="topbar-slash">/</span><strong>{nav === 'files' ? '文件管理' : nav === 'transfers' ? '传输任务' : '连接设置'}</strong></div><div className="topbar-account"><Tag bordered={false} color={connected ? 'success' : 'default'}><span className={`status-dot ${connected ? 'online' : ''}`} />{connected ? '已连接' : '未连接'}</Tag>{connected && status?.account ? <Dropdown menu={{ items: [...status.accounts.map(account => ({ key: `account:${account.id}`, label: `${account.name} · ${account.username}`, icon: account.id === status.account?.id ? <CheckOutlined /> : <SwapOutlined />, disabled: switching || loggingOut || account.id === status.account?.id })), { type: 'divider' as const }, { key: 'add', label: '添加账号', icon: <LinkOutlined />, disabled: !status.configured || !!status.loginIssue || switching }, { key: 'settings', label: '连接设置', icon: <SettingOutlined /> }, { key: 'logout', label: '移除当前授权', icon: <LogoutOutlined />, danger: true }], onClick: ({ key }) => { if (key.startsWith('account:')) void switchAccount(key.slice(8)); else if (key === 'add') addAccount(); else if (key === 'logout') void logout(); else setNav('settings'); } }}><button className="account-button" aria-label="切换 OneDrive 账号" disabled={switching || loggingOut}><Avatar size={30} style={{ background: '#e8f0ff', color: '#1765e8' }}>{status.account.name.slice(0, 1).toUpperCase()}</Avatar><span>{status.account.name}</span></button></Dropdown> : <Avatar size={30} icon={<CloudOutlined />} style={{ background: '#f0f3f9', color: '#9ca9bf' }} />}</div></header>
       <main className="main-content">
         <div className="page-heading"><div><div className="eyebrow">ONEDRIVE WORKSPACE</div><h1>{nav === 'files' ? '我的文件' : nav === 'transfers' ? '传输任务' : '连接设置'}</h1><p>{nav === 'files' ? '有序管理每一份文件，让云端触手可及。' : nav === 'transfers' ? '查看上传进度，随时暂停与继续。' : '管理微软账号授权与本机连接配置。'}</p></div><div className="page-hint"><SafetyCertificateOutlined /> 你的文件，由你掌控</div></div>
         {initialError && <Alert type="error" title="无法打开本地服务" description={initialError} showIcon action={<Button onClick={() => void initialize()}>重试</Button>} />}
         {connected && nav === 'files' && driveError && <Alert type="error" title="暂时无法读取云盘" description={driveError} showIcon action={<Button onClick={() => window.location.reload()}>重新加载</Button>} style={{ marginBottom: 20 }} />}
         {reauth && <Alert type="warning" title="需要重新确认授权" description="当前授权已失效，请重新连接 OneDrive 后继续。" showIcon style={{ marginBottom: 20 }} />}
-        {nav === 'settings' && status ? <ConnectionSettings status={{ ...status, connected }} account={connected ? status.account : null} onRefresh={initialize} onLogout={logout} loggingOut={loggingOut} /> : !connected ? status && <ConnectPanel status={status} onSettings={() => setNav('settings')} /> : nav === 'transfers' ? <>
+        {nav === 'settings' && status ? <ConnectionSettings status={{ ...status, connected }} account={connected ? status.account : null} onRefresh={initialize} onLogout={logout} loggingOut={loggingOut} onSwitch={switchAccount} onAdd={addAccount} busy={switching || loggingOut} /> : !connected ? status && <ConnectPanel status={status} onSettings={() => setNav('settings')} /> : nav === 'transfers' ? <>
           <div className="transfer-summary"><div><span className="summary-icon blue"><CloudUploadOutlined /></span><span><strong>{uploads.tasks.filter(t => t.state === 'uploading').length}</strong><small>正在上传</small></span></div><div><span className="summary-icon amber"><PauseCircleOutlined /></span><span><strong>{uploads.tasks.filter(t => ['paused', 'failed', 'pending'].includes(t.state)).length}</strong><small>等待继续</small></span></div><div><span className="summary-icon green"><CheckOutlined /></span><span><strong>{uploads.tasks.filter(t => t.state === 'completed').length}</strong><small>已完成</small></span></div></div>
           <div className="panel"><div className="panel-heading"><h3>上传记录 <span>{uploads.tasks.length}</span></h3><Button icon={<ReloadOutlined />} onClick={() => void uploads.load()}>刷新</Button></div><div className="transfer-tip"><InfoCircleOutlined /> 刷新页面后，选择原文件即可继续未完成的任务。最多同时上传 3 个文件。</div>{uploads.tasks.length ? <div className="task-list">{uploads.tasks.map(task => <div className="task-row" key={task.id}><FileIcon item={{ name: task.name }} /><div className="task-content"><div className="task-title"><strong title={task.name}>{task.name}</strong><Tag color={task.state === 'completed' ? 'success' : task.state === 'failed' || task.state === 'expired' ? 'error' : task.state === 'uploading' ? 'processing' : 'default'}>{stateNames[task.state]}</Tag></div><Progress percent={task.size ? Math.round(task.offset / task.size * 100) : task.state === 'completed' ? 100 : 0} status={task.state === 'failed' || task.state === 'expired' ? 'exception' : task.state === 'completed' ? 'success' : 'normal'} size="small" /><div className="task-meta"><span>{formatBytes(task.offset)} / {formatBytes(task.size)}</span><span>{formatDate(task.createdAt)}</span></div>{task.error && <p className="task-error">{task.error}</p>}</div><Space className="task-actions">{['uploading', 'pending'].includes(task.state) && <Tooltip title="暂停（当前分片完成后生效）"><Button aria-label={`暂停 ${task.name}`} icon={<PauseCircleOutlined />} onClick={() => void uploads.pause(task).catch(e => message.error(friendlyError(e)))} /></Tooltip>}{['paused', 'failed'].includes(task.state) && <Button icon={<PlayCircleOutlined />} onClick={() => { resumeTarget.current = task; resumeInput.current?.click(); }}>选择文件继续</Button>}{!['completed', 'cancelled', 'expired'].includes(task.state) && <Tooltip title="取消任务"><Button aria-label={`取消 ${task.name}`} type="text" danger icon={<DeleteOutlined />} onClick={() => void uploads.cancel(task).catch(e => message.error(friendlyError(e)))} /></Tooltip>}</Space></div>)}</div> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无上传任务" style={{ padding: 55 }}><Button type="primary" onClick={() => { setNav('files'); fileInput.current?.click(); }}>上传第一个文件</Button></Empty>}</div>
         </> : <>
@@ -237,7 +258,7 @@ function ConnectPanel({ status, onSettings }: { status: AuthStatus; onSettings: 
   </>;
 }
 function Feature({ icon, tone, title, text }: { icon: React.ReactNode; tone: string; title: string; text: string }) { return <div className="feature-card"><span className={`feature-icon ${tone}`}>{icon}</span><h3>{title}</h3><p>{text}</p></div>; }
-function ConnectionSettings({ status, account, onRefresh, onLogout, loggingOut }: { status: AuthStatus; account: Account | null; onRefresh: () => Promise<void>; onLogout: () => Promise<void>; loggingOut: boolean }) {
+function ConnectionSettings({ status, account, onRefresh, onLogout, loggingOut, onSwitch, onAdd, busy }: { status: AuthStatus; account: Account | null; onRefresh: () => Promise<void>; onLogout: () => Promise<void>; loggingOut: boolean; onSwitch: (id: string) => Promise<void>; onAdd: () => void; busy: boolean }) {
   const { message } = AntApp.useApp();
-  return <div className="settings-grid"><div className="panel settings-panel"><div className="panel-heading"><h3>OneDrive 连接</h3><Tag color={status.connected ? 'success' : status.configured ? 'blue' : 'warning'}>{status.connected ? '已连接' : status.configured ? '等待授权' : '待配置'}</Tag></div><div className="settings-inner">{account ? <><div className="connected-account"><Avatar size={52} style={{ background: '#e8f0ff', color: '#1765e8' }}>{account.name.slice(0, 1).toUpperCase()}</Avatar><div><strong>{account.name}</strong><p>{account.username}</p></div></div><Alert type="success" title="已通过微软账号安全授权" showIcon /><Button danger icon={<DisconnectOutlined />} loading={loggingOut} onClick={() => void onLogout()} style={{ marginTop: 20 }}>断开连接</Button></> : <><p className="muted">连接个人微软账号或国际版 Microsoft 365 工作 / 学校账号。</p><Button type="primary" icon={<LinkOutlined />} href="/api/auth/login" disabled={!status.configured || !!status.loginIssue}>连接 OneDrive</Button></>}<Divider />{status.loginIssue && <Alert type="warning" showIcon title="授权地址需要配置" description={status.loginIssue} style={{ marginBottom: 20 }} />}<Descriptions column={1} size="small" items={[{ key: 'app', label: '应用配置', children: status.configured ? <Tag color="success">已填写</Tag> : <span>缺少 {status.missing.join('、')}</span> }, { key: 'origin', label: '页面地址', children: status.origin }, { key: 'callback', label: '授权回调', children: <span className="setting-url">{status.redirectUri}</span> }]} /></div></div><div className="panel settings-panel"><div className="panel-heading"><h3>首次配置指引</h3><SafetyCertificateOutlined /></div><div className="settings-inner"><div className="setup-step"><span>1</span><div><h4>注册微软应用</h4><p>在 Microsoft Entra 应用注册中，新建支持“任何组织目录和个人 Microsoft 账号”的应用。</p><a href="https://learn.microsoft.com/entra/identity-platform/quickstart-register-app" target="_blank" rel="noreferrer">查看微软注册说明 <LinkOutlined /></a></div></div><div className="setup-step"><span>2</span><div><h4>添加 Web 回调与权限</h4><p>平台选择 <strong>Web</strong>，回调地址填写：</p><div className="copy-box"><code>{status.redirectUri}</code><Tooltip title="复制回调地址"><Button type="text" size="small" icon={<CopyOutlined />} aria-label="复制回调地址" onClick={() => void copyText(status.redirectUri).then(() => message.success('已复制')).catch(() => message.error('复制失败，请手动复制'))} /></Tooltip></div><p>添加委托权限 <code>User.Read</code>、<code>Files.ReadWrite</code>，创建客户端密钥并保存密钥值。</p></div></div><div className="setup-step"><span>3</span><div><h4>填写本机配置并重启</h4><p>在项目的 <code>.env</code> 文件填写 <code>MS_CLIENT_ID</code> 和 <code>MS_CLIENT_SECRET</code>，运行 <code>npm run restart</code>。</p><Button icon={<ReloadOutlined />} onClick={() => void onRefresh()}>重新检查配置</Button></div></div><div className="settings-tip"><InfoCircleOutlined /> 局域网设备登录请使用同一 HTTPS 域名的页面地址和授权回调。企业账号可能需要组织管理员批准授权。</div></div></div></div>;
+  return <div className="settings-grid"><div className="panel settings-panel"><div className="panel-heading"><h3>OneDrive 连接</h3><Tag color={status.connected ? 'success' : status.configured ? 'blue' : 'warning'}>{status.connected ? '已连接' : status.configured ? '等待授权' : '待配置'}</Tag></div><div className="settings-inner"><AccountConnections status={status} busy={busy} onSwitch={onSwitch} onAdd={onAdd} />{account && <Button danger icon={<DisconnectOutlined />} loading={loggingOut} disabled={busy && !loggingOut} onClick={() => void onLogout()} style={{ marginTop: 20 }}>移除当前授权</Button>}<Divider />{status.loginIssue && <Alert type="warning" showIcon title="授权地址需要配置" description={status.loginIssue} style={{ marginBottom: 20 }} />}<Descriptions column={1} size="small" items={[{ key: 'app', label: '应用配置', children: status.configured ? <Tag color="success">已填写</Tag> : <span>缺少 {status.missing.join('、')}</span> }, { key: 'origin', label: '页面地址', children: status.origin }, { key: 'callback', label: '授权回调', children: <span className="setting-url">{status.redirectUri}</span> }]} /></div></div><div className="panel settings-panel"><div className="panel-heading"><h3>首次配置指引</h3><SafetyCertificateOutlined /></div><div className="settings-inner"><div className="setup-step"><span>1</span><div><h4>注册微软应用</h4><p>在 Microsoft Entra 应用注册中，新建支持“任何组织目录和个人 Microsoft 账号”的应用。</p><a href="https://learn.microsoft.com/entra/identity-platform/quickstart-register-app" target="_blank" rel="noreferrer">查看微软注册说明 <LinkOutlined /></a></div></div><div className="setup-step"><span>2</span><div><h4>添加 Web 回调与权限</h4><p>平台选择 <strong>Web</strong>，回调地址填写：</p><div className="copy-box"><code>{status.redirectUri}</code><Tooltip title="复制回调地址"><Button type="text" size="small" icon={<CopyOutlined />} aria-label="复制回调地址" onClick={() => void copyText(status.redirectUri).then(() => message.success('已复制')).catch(() => message.error('复制失败，请手动复制'))} /></Tooltip></div><p>添加委托权限 <code>User.Read</code>、<code>Files.ReadWrite</code>，创建客户端密钥并保存密钥值。</p></div></div><div className="setup-step"><span>3</span><div><h4>填写本机配置并重启</h4><p>在项目的 <code>.env</code> 文件填写 <code>MS_CLIENT_ID</code> 和 <code>MS_CLIENT_SECRET</code>，运行 <code>npm run restart</code>。</p><Button icon={<ReloadOutlined />} onClick={() => void onRefresh()}>重新检查配置</Button></div></div><div className="settings-tip"><InfoCircleOutlined /> 局域网设备登录请使用同一 HTTPS 域名的页面地址和授权回调。企业账号可能需要组织管理员批准授权。</div></div></div></div>;
 }

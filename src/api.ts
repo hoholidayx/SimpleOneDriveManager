@@ -1,10 +1,12 @@
 import type { ApiErrorBody, AuthStatus } from '../shared/types';
 let csrf = '';
+let accountId = '';
 export class ApiError extends Error {
   constructor(public status: number, public code: string, message: string) { super(message); }
 }
 async function apiResponse(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
+  if (accountId && path !== '/auth/status') headers.set('X-Account-ID', accountId);
   if (init.body && typeof init.body === 'string') headers.set('Content-Type', 'application/json');
   if (init.method && !['GET', 'HEAD'].includes(init.method)) headers.set('X-CSRF-Token', csrf);
   let res: Response;
@@ -13,6 +15,7 @@ async function apiResponse(path: string, init: RequestInit = {}): Promise<Respon
   if (!res.ok) {
     const body = await res.json().catch(() => null) as ApiErrorBody | null;
     if (res.status === 401) window.dispatchEvent(new Event('odm-auth-required'));
+    if (body?.error.code === 'ACCOUNT_CHANGED') window.dispatchEvent(new Event('odm-account-changed'));
     throw new ApiError(res.status, body?.error.code || 'FAILED', body?.error.message || `请求失败（${res.status}）`);
   }
   return res;
@@ -22,7 +25,12 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return res.status === 204 ? undefined as T : await res.json() as T;
 }
 export async function imageBlob(path: string, signal: AbortSignal) { return (await apiResponse(path, { signal })).blob(); }
-export async function authStatus() { const status = await api<AuthStatus>('/auth/status'); csrf = status.csrfToken; return status; }
+export async function authStatus() {
+  const status = await api<AuthStatus>('/auth/status');
+  if (accountId && accountId !== status.account?.id) window.dispatchEvent(new Event('odm-account-changed'));
+  csrf = status.csrfToken; accountId = status.account?.id || '';
+  return status;
+}
 export const json = (value: unknown) => JSON.stringify(value);
 export const pathId = (value: string) => encodeURIComponent(value);
 export function formatBytes(size?: number) {

@@ -8,6 +8,25 @@ import { Store } from '../server/store.js';
 const dirs: string[] = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
 describe('persistent private state', () => {
+  it('persists multiple accounts and browser grants without sharing access between browsers', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'odm-accounts-')); dirs.push(dir);
+    const file = path.join(dir, 'state.sqlite'); const key = randomBytes(32);
+    const store = new Store(file, key);
+    for (const id of ['one', 'two']) store.saveAccount({ id, name: id, username: `${id}@example.com` });
+    const first = store.newSession('two', ['one', 'two']);
+    const second = store.newSession('one');
+    store.close();
+    expect(readFileSync(file).includes(Buffer.from('two@example.com'))).toBe(false);
+    const restored = new Store(file, key);
+    expect(restored.getSession(first.token)?.accountId).toBe('two');
+    expect(restored.sessionAccounts(first.session.hash).map(a => a.id)).toEqual(['one', 'two']);
+    expect(restored.canAccess(second.session.hash, 'two')).toBe(false);
+    restored.removeAccount('two');
+    expect(restored.getSession(first.token)?.accountId).toBeNull();
+    expect(restored.getSession(second.token)?.accountId).toBe('one');
+    expect(restored.canAccess(first.session.hash, 'one')).toBe(true);
+    restored.close();
+  });
   it('encrypts token cache and restores account and sessions after restart', () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'odm-store-')); dirs.push(dir);
     const file = path.join(dir, 'state.sqlite'); const key = randomBytes(32);
@@ -21,9 +40,11 @@ describe('persistent private state', () => {
     const restored = new Store(file, key);
     expect(restored.get('msal')).toBe('secret-refresh-token-for-test');
     expect(restored.getSession(token)?.accountId).toBe('account');
-    expect(restored.getAccount()?.name).toBe('测试');
-    restored.clearAccount();
-    expect(restored.getAccount()).toBeNull(); expect(restored.getSession(token)).toBeNull(); restored.close();
+    expect(restored.getAccount('account')?.name).toBe('测试');
+    expect(restored.sessionAccounts(restored.getSession(token)!.hash).map(a => a.id)).toEqual(['account']);
+    expect(restored.get('account')).toBeNull();
+    restored.removeAccount('account');
+    expect(restored.getAccount('account')).toBeNull(); expect(restored.getSession(token)?.accountId).toBeNull(); restored.close();
   });
   it('binds OAuth state to the requesting browser and consumes it once', () => {
     const store = new Store(':memory:', randomBytes(32));

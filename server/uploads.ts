@@ -20,6 +20,9 @@ export class Uploads {
     return task;
   }
   async create(input: CreateUpload, owner: string) {
+    return this.locked(randomUUID(), () => this.createTask(input, owner));
+  }
+  private async createTask(input: CreateUpload, owner: string) {
     validateName(input.name);
     if (input.sourceName !== undefined) validateName(input.sourceName);
     assert(Number.isSafeInteger(input.size) && input.size >= 0, 'INVALID_SIZE', '文件大小不正确');

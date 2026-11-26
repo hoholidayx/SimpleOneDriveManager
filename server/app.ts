@@ -16,7 +16,8 @@ import { CHUNK_SIZE } from '../shared/types.js';
 import { imageMime, type ThumbnailSize } from '../shared/images.js';
 import { allowedHostnames, loginIssue, requestHostname } from './network.js';
 
-declare module 'fastify' { interface FastifyRequest { session: Session | null } }
+type AccountResources = { graph: Graph; files: Files; uploads: Uploads; disconnecting: boolean };
+declare module 'fastify' { interface FastifyRequest { session: Session | null; resources: AccountResources | null } }
 const string = { type: 'string', minLength: 1, maxLength: 1024 };
 const params = { type: 'object', required: ['id'], properties: { id: string }, additionalProperties: false };
 const object = (properties: Record<string, unknown>, required: string[] = []) => ({ type: 'object', properties, required, additionalProperties: false });
@@ -29,15 +30,24 @@ export async function createApp(config: Config, deps: Dependencies = {}) {
   const store = deps.store || new Store(config.databasePath, config.encryptionKey);
   const auth = deps.auth || new MicrosoftAuth(config, store);
   const graph = deps.graph || new Graph(auth, config.encryptionKey);
-  const files = new Files(graph);
-  const uploads = new Uploads(graph, store);
+  const resources = new Map<string, AccountResources>();
+  function forAccount(accountId: string) {
+    let current = resources.get(accountId);
+    if (!current) {
+      const scoped = graph.forAccount(accountId);
+      current = { graph: scoped, files: new Files(scoped), uploads: new Uploads(scoped, store), disconnecting: false };
+      resources.set(accountId, current);
+    }
+    return current;
+  }
   const instanceId = deps.instanceId || randomUUID();
   await app.register(cookie);
   app.decorateRequest('session', null);
+  app.decorateRequest('resources', null);
   app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: CHUNK_SIZE }, (_req, body, done) => done(null, body));
 
-  function setSession(reply: FastifyReply, accountId: string | null = null) {
-    const { token, session } = store.newSession(accountId);
+  function setSession(reply: FastifyReply, accountId: string | null = null, accounts?: string[]) {
+    const { token, session } = store.newSession(accountId, accounts);
     reply.setCookie('odm_session', token, { path: '/', httpOnly: true, sameSite: 'lax', secure: config.origin.startsWith('https:'), maxAge: 7 * 86400 });
     return session;
   }
@@ -57,8 +67,15 @@ export async function createApp(config: Config, deps: Dependencies = {}) {
       return;
     }
     if (isCallback) { assert(req.session, 'INVALID_STATE', '登录会话已过期，请重新连接', 401); return; }
-    const account = store.getAccount();
-    assert(req.session?.accountId && account?.id === req.session.accountId, 'LOGIN_REQUIRED', '请先连接 OneDrive', 401);
+    assert(req.session, 'LOGIN_REQUIRED', '请先连接 OneDrive', 401);
+    const accountId = req.session.accountId;
+    const expectedAccount = req.headers['x-account-id'] || (route.endsWith('/download') ? (req.query as { accountId?: string }).accountId : undefined);
+    assert(!expectedAccount || expectedAccount === accountId, 'ACCOUNT_CHANGED', '当前账号已在其他标签页切换，请刷新后重试', 409);
+    if (route !== '/api/auth/switch') {
+      assert(accountId && store.canAccess(req.session.hash, accountId), 'LOGIN_REQUIRED', '请先连接 OneDrive', 401);
+      req.resources = forAccount(accountId);
+      assert(!req.resources.disconnecting, 'ACCOUNT_DISCONNECTING', '该账号正在移除授权，请稍后重试', 409);
+    }
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       const supplied = Buffer.from(String(req.headers['x-csrf-token'] || ''));
       const expected = Buffer.from(req.session.csrf);
@@ -68,6 +85,9 @@ export async function createApp(config: Config, deps: Dependencies = {}) {
       const allowed = new Set([requestOrigin, config.origin, new URL(config.redirectUri).origin, ...(!config.production ? ['http://localhost:5173', 'http://127.0.0.1:5173'] : [])]);
       assert(!origin || allowed.has(origin), 'INVALID_ORIGIN', '请求来源不正确', 403);
     }
+  });
+  app.addHook('preHandler', async req => {
+    if (req.resources) assert(!req.resources.disconnecting && store.canAccess(req.session!.hash, owner(req)), 'ACCOUNT_CHANGED', '账号状态已变化，请刷新后重试', 409);
   });
   app.setErrorHandler<FastifyError>((error, req, reply) => {
     const known = error instanceof AppError;
@@ -81,9 +101,9 @@ export async function createApp(config: Config, deps: Dependencies = {}) {
 
   app.get('/health', async () => ({ ok: true, service: 'simple-onedrive-manager', instanceId, pid: process.pid }));
   app.get('/api/auth/status', async req => {
-    const bound = store.getAccount();
-    const connected = !!bound && req.session?.accountId === bound.id;
-    return { configured: auth.configured, missing: auth.missing, connected, account: connected ? bound : null, csrfToken: req.session!.csrf, redirectUri: config.redirectUri, origin: config.origin, loginIssue: auth.configured ? loginIssue(config, req.headers.host || '') : undefined };
+    const accounts = store.sessionAccounts(req.session!.hash);
+    const account = accounts.find(account => account.id === req.session!.accountId) || null;
+    return { configured: auth.configured, missing: auth.missing, connected: !!account, account, accounts, csrfToken: req.session!.csrf, redirectUri: config.redirectUri, origin: config.origin, loginIssue: auth.configured ? loginIssue(config, req.headers.host || '') : undefined };
   });
   app.get('/api/auth/login', async (req, reply) => {
     const issue = auth.configured && loginIssue(config, req.headers.host || '');
@@ -98,34 +118,57 @@ export async function createApp(config: Config, deps: Dependencies = {}) {
     }
     assert(query.code, 'INVALID_CALLBACK', '授权回调缺少授权码');
     const account = await auth.callback(query.code, query.state, req.session!);
+    store.saveAccount(account);
+    const accounts = [...store.sessionAccounts(req.session!.hash).map(account => account.id), account.id];
     store.deleteSession(req.session!.hash);
-    setSession(reply, account.id);
+    setSession(reply, account.id, accounts);
     return reply.redirect(config.origin);
   });
   app.post('/api/auth/logout', async (req, reply) => {
+    const current = req.resources!;
+    const uploads = current.uploads;
     assert(!uploads.isActive(), 'UPLOAD_BUSY', '请先暂停正在传输的任务，等待当前分片完成后再退出', 409);
-    for (const task of store.uploads(owner(req))) {
-      if (!['completed', 'cancelled', 'expired'].includes(task.state)) await uploads.cancel(task.id, owner(req)).catch(() => undefined);
+    current.disconnecting = true;
+    try {
+      for (const task of store.uploads(owner(req))) {
+        if (!['completed', 'cancelled', 'expired'].includes(task.state)) await uploads.cancel(task.id, owner(req)).catch(() => undefined);
+      }
+      await auth.clear(owner(req));
+      resources.delete(owner(req));
+      const remaining = store.sessionAccounts(req.session!.hash).map(account => account.id);
+      store.deleteSession(req.session!.hash);
+      setSession(reply, remaining[0] || null, remaining);
+      return { ok: true };
+    } finally {
+      current.disconnecting = false;
     }
-    await auth.clear();
-    reply.clearCookie('odm_session', { path: '/' });
+  });
+  app.post('/api/auth/switch', { schema: { body: object({ accountId: string }, ['accountId']) } }, async (req, reply) => {
+    const accountId = (req.body as { accountId: string }).accountId;
+    assert(store.canAccess(req.session!.hash, accountId), 'ACCOUNT_NOT_AUTHORIZED', '请先在此浏览器授权该账号', 403);
+    assert(!forAccount(accountId).disconnecting, 'ACCOUNT_DISCONNECTING', '该账号正在移除授权，请稍后重试', 409);
+    if (req.session!.accountId) assert(!forAccount(req.session!.accountId).uploads.isActive(), 'UPLOAD_BUSY', '请先暂停传输，等待当前分片完成后再切换账号', 409);
+    const accounts = store.sessionAccounts(req.session!.hash).map(account => account.id);
+    store.deleteSession(req.session!.hash);
+    setSession(reply, accountId, accounts);
     return { ok: true };
   });
-  app.get('/api/drive', async () => {
+  app.get('/api/drive', async req => {
+    const graph = req.resources!.graph;
     const [drive, root] = await Promise.all([graph.drive(), graph.root()]);
     return { drive, root };
   });
-  app.get('/api/items/:id', { schema: { params } }, req => files.details(id(req)));
-  app.get('/api/items/:id/children', { schema: { params, querystring: object({ cursor: { type: 'string', maxLength: 16_384 } }) } }, req => graph.children(id(req), owner(req), (req.query as { cursor?: string }).cursor));
+  app.get('/api/items/:id', { schema: { params } }, req => req.resources!.files.details(id(req)));
+  app.get('/api/items/:id/children', { schema: { params, querystring: object({ cursor: { type: 'string', maxLength: 16_384 } }) } }, req => req.resources!.graph.children(id(req), owner(req), (req.query as { cursor?: string }).cursor));
   async function imageResponse(req: FastifyRequest, reply: FastifyReply, size?: ThumbnailSize) {
     const controller = new AbortController();
     const abort = () => controller.abort();
     reply.raw.once('close', abort);
     try {
-      const item = await graph.item(id(req), controller.signal);
+      const item = await req.resources!.graph.item(id(req), controller.signal);
       const mime = imageMime(item);
       assert(mime, 'NOT_IMAGE', '此文件不是可预览的图片');
-      const res = size ? await graph.thumbnail(item.id, size, controller.signal) : await graph.original(item.id, controller.signal);
+      const res = size ? await req.resources!.graph.thumbnail(item.id, size, controller.signal) : await req.resources!.graph.original(item.id, controller.signal);
       const contentType = size ? res.headers.get('content-type')?.split(';')[0].trim().toLowerCase() : mime;
       if (!contentType || !/^image\/[a-z0-9.+-]+$/.test(contentType)) {
         await res.body?.cancel();
@@ -149,21 +192,21 @@ export async function createApp(config: Config, deps: Dependencies = {}) {
   }
   app.get('/api/items/:id/thumbnail', { schema: { params, querystring: object({ size: { enum: ['medium', 'large'] } }, ['size']) } }, (req, reply) => imageResponse(req, reply, (req.query as { size: ThumbnailSize }).size));
   app.get('/api/items/:id/original', { schema: { params } }, (req, reply) => imageResponse(req, reply));
-  app.post('/api/items/:id/folders', { schema: { params, body: object({ name: string }, ['name']) } }, req => files.createFolder(id(req), (req.body as { name: string }).name));
-  app.patch('/api/items/:id', { schema: { params, body: object({ name: string, parentId: string, eTag: string }) } }, req => files.update(id(req), req.body as { name?: string; parentId?: string; eTag?: string }));
+  app.post('/api/items/:id/folders', { schema: { params, body: object({ name: string }, ['name']) } }, req => req.resources!.files.createFolder(id(req), (req.body as { name: string }).name));
+  app.patch('/api/items/:id', { schema: { params, body: object({ name: string, parentId: string, eTag: string }) } }, req => req.resources!.files.update(id(req), req.body as { name?: string; parentId?: string; eTag?: string }));
   app.delete('/api/items/:id', { schema: { params, querystring: object({ eTag: string }) } }, async (req, reply) => {
-    await files.remove(id(req), (req.query as { eTag?: string }).eTag);
+    await req.resources!.files.remove(id(req), (req.query as { eTag?: string }).eTag);
     return reply.status(204).send();
   });
   app.get('/api/items/:id/download', { schema: { params } }, async (req, reply) => {
-    const item = await graph.item(id(req));
+    const item = await req.resources!.graph.item(id(req));
     assert(item.file, 'NOT_FILE', '请选择需要下载的文件');
-    let res = await graph.response(`${itemPath(item.id)}/content`);
+    let res = await req.resources!.graph.response(`${itemPath(item.id)}/content`);
     if (res.status === 302) {
       const location = res.headers.get('location');
       await res.body?.cancel();
       assert(location, 'NO_DOWNLOAD_URL', '暂时无法获取下载地址', 502);
-      res = await graph.storage(location);
+      res = await req.resources!.graph.storage(location);
     }
     assert(res.body, 'EMPTY_DOWNLOAD', '文件下载响应为空', 502);
     reply.header('Content-Disposition', `attachment; filename="download"; filename*=UTF-8''${encodeURIComponent(item.name).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16)}`)}`);
@@ -176,17 +219,17 @@ export async function createApp(config: Config, deps: Dependencies = {}) {
   app.post('/api/batch', { schema: { body: object({ action: { enum: ['move', 'delete'] }, parentId: string, items: { type: 'array', minItems: 1, maxItems: 500, items: object({ id: string, eTag: string }, ['id']) } }, ['action', 'items']) } }, async req => {
     const body = req.body as { action: 'move' | 'delete'; items: { id: string; eTag?: string }[]; parentId?: string };
     assert(body.action !== 'move' || body.parentId, 'INVALID_PARENT', '请选择移动目标');
-    return { results: await files.batch(body.action, body.items, body.parentId) };
+    return { results: await req.resources!.files.batch(body.action, body.items, body.parentId) };
   });
   app.get('/api/uploads', req => ({ tasks: store.uploads(owner(req)).map(task => publicTask(['pending', 'uploading'].includes(task.state) ? { ...task, state: 'paused' } : task)) }));
-  app.post('/api/uploads', { schema: { body: object({ name: string, sourceName: string, size: { type: 'integer', minimum: 0 }, lastModified: { type: 'integer', minimum: 0 }, parentId: string, conflict: { enum: ['fail', 'replace', 'rename'] }, itemId: string, eTag: string }, ['name', 'size', 'lastModified', 'parentId']) } }, req => uploads.create(req.body as Parameters<Uploads['create']>[0], owner(req)));
-  app.get('/api/uploads/:id', { schema: { params, querystring: object({ reconcile: { enum: ['1'] } }) } }, req => uploads.status(id(req), owner(req), (req.query as { reconcile?: string }).reconcile === '1'));
+  app.post('/api/uploads', { schema: { body: object({ name: string, sourceName: string, size: { type: 'integer', minimum: 0 }, lastModified: { type: 'integer', minimum: 0 }, parentId: string, conflict: { enum: ['fail', 'replace', 'rename'] }, itemId: string, eTag: string }, ['name', 'size', 'lastModified', 'parentId']) } }, req => req.resources!.uploads.create(req.body as Parameters<Uploads['create']>[0], owner(req)));
+  app.get('/api/uploads/:id', { schema: { params, querystring: object({ reconcile: { enum: ['1'] } }) } }, req => req.resources!.uploads.status(id(req), owner(req), (req.query as { reconcile?: string }).reconcile === '1'));
   app.put('/api/uploads/:id/content', { schema: { params } }, req => {
     assert(Buffer.isBuffer(req.body), 'INVALID_CONTENT', '请使用二进制方式上传文件内容');
-    return uploads.write(id(req), owner(req), req.body, req.headers['content-range'] as string | undefined);
+    return req.resources!.uploads.write(id(req), owner(req), req.body, req.headers['content-range'] as string | undefined);
   });
-  app.post('/api/uploads/:id/pause', { schema: { params } }, req => uploads.pause(id(req), owner(req)));
-  app.delete('/api/uploads/:id', { schema: { params } }, req => uploads.cancel(id(req), owner(req)));
+  app.post('/api/uploads/:id/pause', { schema: { params } }, req => req.resources!.uploads.pause(id(req), owner(req)));
+  app.delete('/api/uploads/:id', { schema: { params } }, req => req.resources!.uploads.cancel(id(req), owner(req)));
 
   const clientDir = path.join(config.root, 'dist/client');
   if (existsSync(path.join(clientDir, 'index.html'))) {
@@ -201,5 +244,5 @@ export async function createApp(config: Config, deps: Dependencies = {}) {
     });
   } else app.get('/', (_req, reply) => reply.type('text/html').send('<meta charset="utf-8"><p>开发页面：<a href="http://localhost:5173">http://localhost:5173</a>。生产运行请先执行 npm run build。</p>'));
   app.addHook('onClose', async () => { if (!deps.store) store.close(); });
-  return { app, store, auth, graph, files, uploads };
+  return { app, store, auth, graph };
 }

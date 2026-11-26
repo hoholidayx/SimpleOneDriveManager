@@ -152,6 +152,35 @@ try {
     });
     await screenshot('preview-mobile'); await closePreview();
   });
+  await check('添加第二账号后切换文件，移除账号保留其他授权', async () => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.getByRole('button', { name: '连接设置' }).click();
+    await page.getByRole('button', { name: '添加账号' }).click();
+    await page.getByRole('button', { name: '打开 第二账号专属.txt', exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: '打开 第一账号专属.txt', exact: true }).count(), 0);
+    // A fresh page has no file-list layout or jobs from the previous account.
+    await page.getByRole('button', { name: '文本列表', exact: true }).click();
+    await page.getByRole('button', { name: '连接设置' }).click();
+    await page.getByRole('button', { name: '切换到 browser-test@example.com', exact: true }).waitFor();
+    await screenshot('multiple-accounts');
+    await page.getByRole('button', { name: '切换到 browser-test@example.com', exact: true }).click();
+    await page.getByRole('button', { name: '第一账号专属.txt', exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: '第二账号专属.txt', exact: true }).count(), 0);
+    // The header offers the same switch without opening settings.
+    await page.getByRole('button', { name: '切换 OneDrive 账号', exact: true }).click();
+    await page.getByRole('menuitem', { name: /第二账号（模拟 OneDrive）/ }).click();
+    await page.getByRole('button', { name: '第二账号专属.txt', exact: true }).waitFor();
+    await page.getByRole('button', { name: '连接设置' }).click();
+    await page.getByRole('button', { name: '移除当前授权' }).click();
+    await page.getByRole('button', { name: '移除授权', exact: true }).click();
+    await page.getByRole('button', { name: '第一账号专属.txt', exact: true }).waitFor();
+    await page.getByRole('button', { name: '连接设置' }).click();
+    assert.equal(await page.locator('.saved-account').count(), 1);
+    assert.equal(await page.getByText('second@example.com', { exact: true }).count(), 0);
+    await page.setViewportSize({ width: 390, height: 844 }); await settle();
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await screenshot('accounts-mobile');
+  });
   assert.deepEqual(pageErrors, []);
   console.log(`${checks} browser checks passed; screenshots: .runtime/browser-screenshots/`);
 } catch (error) {

@@ -24,6 +24,16 @@ function fixture(configured = true) {
   return { store, auth: new MicrosoftAuth(config, store) };
 }
 describe('Microsoft OAuth and token lifecycle', () => {
+  it('selects and refreshes the exact requested account and rejects unknown accounts', async () => {
+    const { store, auth } = fixture();
+    for (const id of ['one', 'two']) store.saveAccount({ id, name: id, username: `${id}@example.com` });
+    mock.getAccountByHomeId.mockImplementation(async id => ({ homeAccountId: id }));
+    mock.acquireTokenSilent.mockImplementation(async ({ account, forceRefresh }) => ({ accessToken: `${account.homeAccountId}:${forceRefresh}` }));
+    expect(await Promise.all([auth.token('one'), auth.token('two', true)])).toEqual(['one:false', 'two:true']);
+    await expect(auth.token('unknown')).rejects.toMatchObject({ code: 'LOGIN_REQUIRED' });
+    expect(mock.getAccountByHomeId.mock.calls.map(call => call[0])).toEqual(['one', 'two']);
+    store.close();
+  });
   it('configures PKCE, nonce and least-privilege scopes then binds the returned identity', async () => {
     const { store, auth } = fixture();
     const { session } = store.newSession();
@@ -33,31 +43,32 @@ describe('Microsoft OAuth and token lifecycle', () => {
     expect(request.scopes).toContain('Files.ReadWrite'); expect(request.scopes).not.toContain('Files.ReadWrite.All');
     mock.acquireTokenByCode.mockResolvedValue({ account: { homeAccountId: 'owner', username: 'test@example.com', name: '用户' }, idTokenClaims: { nonce: request.nonce } });
     const account = await auth.callback('code', request.state, session);
-    expect(account.id).toBe('owner'); expect(store.getAccount()).toEqual(account);
+    expect(account.id).toBe('owner'); expect(store.getAccount('owner')).toEqual(account);
     expect(mock.acquireTokenByCode).toHaveBeenCalledWith(expect.objectContaining({ codeVerifier: 'test-verifier' }));
     await expect(auth.callback('code', request.state, session)).rejects.toMatchObject({ code: 'INVALID_STATE' }); store.close();
   });
-  it('rejects a nonce mismatch and a different bound account', async () => {
+  it('rejects a nonce mismatch but accepts additional accounts with valid state', async () => {
     const { store, auth } = fixture(); const { session } = store.newSession();
     await auth.login(session); let request = mock.getAuthCodeUrl.mock.calls.at(-1)![0];
     mock.acquireTokenByCode.mockResolvedValue({ account: { homeAccountId: 'owner', username: 'test@example.com' }, idTokenClaims: { nonce: 'wrong' } });
     await expect(auth.callback('code', request.state, session)).rejects.toMatchObject({ code: 'INVALID_IDENTITY' });
     expect(mock.removeAccount).toHaveBeenCalledWith(expect.objectContaining({ homeAccountId: 'owner' }));
-    expect(store.getAccount()).toBeNull();
-    store.set('account', { id: 'existing', name: '原用户', username: 'existing@example.com' });
+    expect(store.getAccount('owner')).toBeNull();
+    store.saveAccount({ id: 'existing', name: '原用户', username: 'existing@example.com' });
     await auth.login(session); request = mock.getAuthCodeUrl.mock.calls.at(-1)![0];
     mock.acquireTokenByCode.mockResolvedValue({ account: { homeAccountId: 'other', username: 'other@example.com' }, idTokenClaims: { nonce: request.nonce } });
-    await expect(auth.callback('code', request.state, session)).rejects.toMatchObject({ code: 'ACCOUNT_BOUND' });
-    expect(store.getAccount()?.id).toBe('existing'); expect(mock.removeAccount).toHaveBeenCalled(); store.close();
+    expect((await auth.callback('code', request.state, session)).id).toBe('other');
+    expect(store.getAccount('existing')?.id).toBe('existing'); expect(store.getAccount('other')?.id).toBe('other');
+    expect(request.prompt).toBe('select_account'); expect(request.loginHint).toBeUndefined(); store.close();
   });
   it('refreshes through MSAL and reports when interactive authorization is required', async () => {
-    const { store, auth } = fixture(); store.set('account', { id: 'owner', name: 'User', username: 'test@example.com' });
+    const { store, auth } = fixture(); store.saveAccount({ id: 'owner', name: 'User', username: 'test@example.com' });
     mock.getAccountByHomeId.mockResolvedValue({ homeAccountId: 'owner' });
     mock.acquireTokenSilent.mockResolvedValue({ accessToken: 'fresh-token' });
-    expect(await auth.token(true)).toBe('fresh-token');
+    expect(await auth.token('owner', true)).toBe('fresh-token');
     expect(mock.acquireTokenSilent).toHaveBeenCalledWith(expect.objectContaining({ forceRefresh: true }));
     mock.acquireTokenSilent.mockRejectedValue(new InteractionRequiredAuthError('interaction_required'));
-    await expect(auth.token()).rejects.toMatchObject({ code: 'REAUTH_REQUIRED' }); store.close();
+    await expect(auth.token('owner')).rejects.toMatchObject({ code: 'REAUTH_REQUIRED' }); store.close();
   });
   it('persists cache through the MSAL plugin and clears local state on logout', async () => {
     const { store, auth } = fixture();
@@ -66,8 +77,16 @@ describe('Microsoft OAuth and token lifecycle', () => {
     const deserialize = vi.fn(); await plugin.beforeCacheAccess({ tokenCache: { deserialize } });
     expect(deserialize).toHaveBeenCalledWith('encrypted-cache-content');
     mock.getAllAccounts.mockResolvedValue([{ homeAccountId: 'owner' }]);
-    store.set('account', { id: 'owner', name: 'User', username: 'test@example.com' }); const { token } = store.newSession('owner');
-    await auth.clear(); expect(mock.removeAccount).toHaveBeenCalled(); expect(store.get('msal')).toBeNull(); expect(store.getSession(token)).toBeNull(); store.close();
+    store.saveAccount({ id: 'owner', name: 'User', username: 'test@example.com' }); const { token } = store.newSession('owner');
+    mock.getAccountByHomeId.mockResolvedValue({ homeAccountId: 'owner' });
+    store.saveAccount({ id: 'other', name: 'Other', username: 'other@example.com' });
+    const other = store.newSession('other');
+    await auth.clear('owner');
+    expect(mock.getAccountByHomeId).toHaveBeenCalledWith('owner');
+    expect(mock.removeAccount).toHaveBeenCalledWith({ homeAccountId: 'owner' });
+    expect(mock.removeAccount).toHaveBeenCalledTimes(1);
+    expect(store.getAccount('owner')).toBeNull(); expect(store.getSession(token)?.accountId).toBeNull();
+    expect(store.getAccount('other')?.id).toBe('other'); expect(store.getSession(other.token)?.accountId).toBe('other'); store.close();
   });
   it('shows missing configuration without starting an authorization request', async () => {
     const { store, auth } = fixture(false); expect(auth.missing).toEqual(['MS_CLIENT_ID', 'MS_CLIENT_SECRET']);

@@ -24,15 +24,125 @@ beforeEach(async () => {
   mkdirSync(path.join(staticRoot, 'dist/client'), { recursive: true });
   writeFileSync(path.join(staticRoot, 'dist/client/index.html'), '<!doctype html><html><title>Test Manager</title></html>');
   const account = { id: 'owner', name: '测试用户', username: 'test@example.com' };
-  store.set('account', account);
+  store.saveAccount(account);
   const { token, session } = store.newSession('owner');
   headers = { host: 'localhost:3000', cookie: `odm_session=${token}`, 'x-csrf-token': session.csrf, origin: 'http://localhost:3000' };
-  const auth: AuthProvider = { configured: true, missing: [], token: async () => 'token', login: async s => { store.saveOAuth('valid-state', s.hash, { verifier: 'verifier', nonce: 'nonce' }); return 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?state=valid-state'; }, callback: async (_code, state, s) => { if (!store.consumeOAuth(state, s.hash)) throw new AppError(400, 'INVALID_STATE', '授权校验失败'); return account; }, clear: async () => store.clearAccount() };
+  const auth: AuthProvider = { configured: true, missing: [], token: async () => 'token', login: async s => { store.saveOAuth('valid-state', s.hash, { verifier: 'verifier', nonce: 'nonce' }); return 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?state=valid-state'; }, callback: async (_code, state, s) => { if (!store.consumeOAuth(state, s.hash)) throw new AppError(400, 'INVALID_STATE', '授权校验失败'); return account; }, clear: async id => store.removeAccount(id) };
   const config: Config = { root: staticRoot, host: '0.0.0.0', port: 3000, origin: 'http://localhost:3000', redirectUri: 'http://localhost:3000/api/auth/callback', clientId: '', clientSecret: '', tenantId: 'common', encryptionKey: key, databasePath: ':memory:', production: true };
   context = await createApp(config, { store, auth, graph: new Graph(auth, key, remote.fetch), logger: false });
 });
 afterEach(async () => { await context.app.close(); store.close(); rmSync(staticRoot, { recursive: true, force: true }); });
 describe('HTTP boundaries and application flow', () => {
+  function browser(accountId: string, accounts = [accountId]) {
+    const { token, session } = store.newSession(accountId, accounts);
+    return { ...headers, cookie: `odm_session=${token}`, 'x-csrf-token': session.csrf, 'x-account-id': accountId };
+  }
+  async function sessionHeaders(cookie: string) {
+    const result = await context.app.inject({ url: '/api/auth/status', headers: { ...headers, cookie } });
+    return { ...headers, cookie, 'x-csrf-token': result.json().csrfToken, 'x-account-id': result.json().account?.id || '' };
+  }
+  const other = { id: 'other', name: '第二账号', username: 'other@example.com' };
+  it('adds an OAuth identity without losing existing grants and hides accounts from new browsers', async () => {
+    context.auth.callback = async () => other;
+    const callback = await context.app.inject({ url: '/api/auth/callback?code=code&state=test', headers });
+    const next = await sessionHeaders(`odm_session=${callback.cookies[0].value}`);
+    const status = (await context.app.inject({ url: '/api/auth/status', headers: next })).json();
+    expect(status.account.id).toBe('other');
+    expect(status.accounts.map((a: { id: string }) => a.id)).toEqual(['owner', 'other']);
+    expect((await context.app.inject({ url: '/api/drive', headers })).statusCode).toBe(401);
+    const fresh = await context.app.inject({ url: '/api/auth/status', headers: { host: 'localhost:3000' } });
+    expect(fresh.json().accounts).toEqual([]); expect(fresh.json().account).toBeNull();
+    const guess = await context.app.inject({ method: 'POST', url: '/api/auth/switch', payload: { accountId: 'other' }, headers: { ...headers, cookie: `odm_session=${fresh.cookies[0].value}`, 'x-csrf-token': fresh.json().csrfToken } });
+    expect(guess.statusCode).toBe(403); expect(guess.json().error.code).toBe('ACCOUNT_NOT_AUTHORIZED');
+  });
+  it('routes concurrent requests and token refreshes to their original account', async () => {
+    store.saveAccount(other);
+    const seen: string[] = [];
+    context.auth.token = async (id, force) => `${id}:${force ? 'fresh' : 'cached'}`;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    context.graph.fetcher = async (_url, init) => {
+      const bearer = new Headers(init?.headers).get('authorization')!; seen.push(bearer);
+      if (bearer === 'Bearer owner:cached') { await gate; return new Response('{}', { status: 401 }); }
+      return Response.json({ id: bearer, name: bearer, size: 0, folder: { childCount: 0 } });
+    };
+    const first = context.app.inject({ url: '/api/drive', headers: browser('owner') }).then(result => result);
+    const second = await context.app.inject({ url: '/api/drive', headers: browser('other') });
+    expect(second.json().drive.id).toBe('Bearer other:cached'); release();
+    expect((await first).json().drive.id).toBe('Bearer owner:fresh');
+    expect(seen).toContain('Bearer owner:fresh'); expect(seen).not.toContain('Bearer other:fresh');
+  });
+  it('switches with CSRF and rotated cookies, isolates uploads and removes only the current account', async () => {
+    store.saveAccount(other);
+    const original = browser('owner', ['owner', 'other']);
+    const input = { name: 'only-owner.txt', size: 4, parentId: 'root', lastModified: 1 };
+    const upload = await context.app.inject({ method: 'POST', url: '/api/uploads', payload: input, headers: original });
+    const taskId = upload.json().id;
+    const change = { method: 'POST' as const, url: '/api/auth/switch', payload: { accountId: 'other' } };
+    expect((await context.app.inject({ ...change, headers: { ...original, 'x-csrf-token': 'wrong' } })).statusCode).toBe(403);
+    const switched = await context.app.inject({ ...change, headers: original });
+    expect(switched.statusCode).toBe(200); expect(switched.cookies[0].value).not.toBe(original.cookie.split('=')[1]);
+    let next = await sessionHeaders(`odm_session=${switched.cookies[0].value}`);
+    expect((await context.app.inject({ url: '/api/uploads', headers: next })).json().tasks).toEqual([]);
+    expect((await context.app.inject({ url: `/api/uploads/${taskId}`, headers: next })).statusCode).toBe(404);
+    expect((await context.app.inject({ method: 'DELETE', url: `/api/uploads/${taskId}`, headers: next })).statusCode).toBe(404);
+    const stale = await context.app.inject({ method: 'POST', url: '/api/items/root/folders', payload: { name: 'wrong-account' }, headers: { ...next, 'x-account-id': 'owner' } });
+    expect(stale.statusCode).toBe(409); expect(stale.json().error.code).toBe('ACCOUNT_CHANGED');
+    expect((await context.app.inject({ url: '/api/items/note/download?accountId=owner', headers: { ...next, 'x-account-id': '' } })).statusCode).toBe(409);
+    const removed = await context.app.inject({ method: 'POST', url: '/api/auth/logout', headers: next });
+    expect(removed.statusCode).toBe(200);
+    next = await sessionHeaders(`odm_session=${removed.cookies[0].value}`);
+    expect(next['x-account-id']).toBe('owner'); expect(store.getAccount('other')).toBeNull();
+    expect((await context.app.inject({ url: '/api/uploads', headers: next })).json().tasks[0].id).toBe(taskId);
+    expect((await context.app.inject({ url: '/api/drive', headers: next })).statusCode).toBe(200);
+  });
+  it('blocks switching while a chunk is in flight without affecting the upload', async () => {
+    store.saveAccount(other);
+    const original = browser('owner', ['owner', 'other']);
+    const upload = await context.app.inject({ method: 'POST', url: '/api/uploads', payload: { name: 'in-flight.txt', size: 4, parentId: 'root', lastModified: 1 }, headers: original });
+    let release!: () => void; let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const fetcher = remote.fetch;
+    context.graph.fetcher = async (url, init) => { if (init?.method === 'PUT') { entered(); await gate; } return fetcher(url, init); };
+    const writing = context.app.inject({ method: 'PUT', url: `/api/uploads/${upload.json().id}/content`, payload: Buffer.from('test'), headers: { ...original, 'content-type': 'application/octet-stream' } }).then(result => result);
+    await started;
+    try {
+      const switched = await context.app.inject({ method: 'POST', url: '/api/auth/switch', payload: { accountId: 'other' }, headers: original });
+      expect(switched.statusCode).toBe(409); expect(switched.json().error.code).toBe('UPLOAD_BUSY');
+    } finally { release(); }
+    expect((await writing).json().state).toBe('completed');
+  });
+  it('rejects new work during removal while allowing another account to continue', async () => {
+    store.saveAccount(other);
+    let release!: () => void; let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    context.auth.clear = async id => { entered(); await gate; store.removeAccount(id); };
+    const removing = context.app.inject({ method: 'POST', url: '/api/auth/logout', headers }).then(result => result);
+    await started;
+    try {
+      const work = await context.app.inject({ method: 'POST', url: '/api/uploads', payload: { name: 'late.txt', size: 0, parentId: 'root', lastModified: 1 }, headers });
+      expect(work.statusCode).toBe(409); expect(work.json().error.code).toBe('ACCOUNT_DISCONNECTING');
+      expect((await context.app.inject({ url: '/api/drive', headers: browser('other') })).statusCode).toBe(200);
+    } finally { release(); }
+    expect((await removing).statusCode).toBe(200);
+    expect(store.uploads('owner')).toEqual([]);
+  });
+  it('rejects a previously admitted upload whose body arrives after account removal', async () => {
+    let release!: () => void; let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    context.app.addHook('preParsing', async (req, _reply, payload) => {
+      if (req.url === '/api/uploads') { entered(); await gate; } return payload;
+    });
+    const creating = context.app.inject({ method: 'POST', url: '/api/uploads', payload: { name: 'late.txt', size: 0, parentId: 'root', lastModified: 1 }, headers }).then(result => result);
+    await started;
+    try { expect((await context.app.inject({ method: 'POST', url: '/api/auth/logout', headers })).statusCode).toBe(200); }
+    finally { release(); }
+    expect((await creating).statusCode).toBe(409);
+    expect(store.uploads('owner')).toEqual([]);
+  });
   it('serves the built index document and browser routes', async () => {
     for (const url of ['/', '/workspace']) {
       const result = await context.app.inject({ url, headers });

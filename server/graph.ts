@@ -32,11 +32,15 @@ export function validateImageUrl(value: string, thumbnail: boolean) {
 }
 
 export class Graph {
-  constructor(private auth: AuthProvider, private key: Buffer, public fetcher: Fetcher = fetch, private wait = delay) {}
+  constructor(private auth: AuthProvider, private key: Buffer, public fetcher: Fetcher = fetch, private wait = delay, private accountId = '') {}
+  forAccount(accountId: string) {
+    return new Graph(this.auth, this.key, (input, init) => this.fetcher(input, init), this.wait, accountId);
+  }
   async response(path: string, init: RequestInit = {}, retry = true): Promise<Response> {
     assert(path.startsWith('/') && !path.startsWith('//'), 'INVALID_GRAPH_PATH', '接口路径不正确');
+    assert(this.accountId, 'LOGIN_REQUIRED', '请求必须指定已授权账号', 401);
     const headers = new Headers(init.headers);
-    headers.set('Authorization', `Bearer ${await this.auth.token()}`);
+    headers.set('Authorization', `Bearer ${await this.auth.token(this.accountId)}`);
     if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
     const safeToRetry = retry && (!init.method || ['GET', 'HEAD'].includes(init.method));
     let refreshed = false;
@@ -47,7 +51,7 @@ export class Graph {
       catch { throw new AppError(502, 'GRAPH_NETWORK', '暂时无法连接 OneDrive，请检查网络后重试'); }
       if (res.status === 401 && !refreshed) {
         await res.body?.cancel();
-        headers.set('Authorization', `Bearer ${await this.auth.token(true)}`);
+        headers.set('Authorization', `Bearer ${await this.auth.token(this.accountId, true)}`);
         refreshed = true;
         continue;
       }

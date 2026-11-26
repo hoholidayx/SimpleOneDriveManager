@@ -11,7 +11,7 @@ import { FakeDrive } from './fake-drive.js';
 let remote: FakeDrive; let graph: Graph; let store: Store; let uploads: Uploads; let files: Files;
 beforeEach(() => {
   remote = new FakeDrive(); store = new Store(':memory:', randomBytes(32));
-  graph = new Graph({ token: async () => 'token' } as AuthProvider, randomBytes(32), remote.fetch);
+  graph = new Graph({ token: async () => 'token' } as AuthProvider, randomBytes(32), remote.fetch).forAccount('owner');
   files = new Files(graph); uploads = new Uploads(graph, store);
 });
 afterEach(() => store.close());

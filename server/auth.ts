@@ -10,13 +10,19 @@ export interface AuthProvider {
   configured: boolean; missing: string[];
   login(session: Session): Promise<string>;
   callback(code: string, state: string, session: Session): Promise<Account>;
-  token(forceRefresh?: boolean): Promise<string>;
-  clear(): Promise<void>;
+  token(accountId: string, forceRefresh?: boolean): Promise<string>;
+  clear(accountId: string): Promise<void>;
 }
 export class MicrosoftAuth implements AuthProvider {
   configured: boolean;
   missing: string[];
   private client?: ConfidentialClientApplication;
+  private pending: Promise<unknown> = Promise.resolve();
+  private exclusive<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.pending.then(work);
+    this.pending = result.catch(() => undefined);
+    return result;
+  }
   constructor(private config: Config, private store: Store) {
     this.missing = [!config.clientId && 'MS_CLIENT_ID', !config.clientSecret && 'MS_CLIENT_SECRET'].filter(Boolean) as string[];
     this.configured = this.missing.length === 0;
@@ -34,10 +40,12 @@ export class MicrosoftAuth implements AuthProvider {
     const state = randomBytes(32).toString('base64url');
     const nonce = randomBytes(32).toString('base64url');
     this.store.saveOAuth(state, session.hash, { verifier, nonce });
-    const bound = this.store.getAccount();
-    return this.client.getAuthCodeUrl({ scopes: SCOPES, redirectUri: this.config.redirectUri, state, nonce, codeChallenge: challenge, codeChallengeMethod: 'S256', ...(bound ? { loginHint: bound.username } : { prompt: 'select_account' }) });
+    return this.client.getAuthCodeUrl({ scopes: SCOPES, redirectUri: this.config.redirectUri, state, nonce, codeChallenge: challenge, codeChallengeMethod: 'S256', prompt: 'select_account' });
   }
   async callback(code: string, state: string, session: Session): Promise<Account> {
+    return this.exclusive(() => this.exchange(code, state, session));
+  }
+  private async exchange(code: string, state: string, session: Session): Promise<Account> {
     assert(this.client, 'NOT_CONFIGURED', '微软应用尚未配置', 503);
     const attempt = this.store.consumeOAuth(state, session.hash);
     assert(attempt, 'INVALID_STATE', '授权已过期或校验失败，请重新连接', 400);
@@ -51,16 +59,14 @@ export class MicrosoftAuth implements AuthProvider {
       throw new AppError(401, 'INVALID_IDENTITY', '授权身份校验失败，请重新连接');
     }
     const account: Account = { id: result.account.homeAccountId, name: result.account.name || result.account.username, username: result.account.username };
-    const bound = this.store.getAccount();
-    if (bound && bound.id !== account.id) {
-      await this.client.getTokenCache().removeAccount(result.account);
-      throw new AppError(409, 'ACCOUNT_BOUND', '已连接其他账号，请在原会话退出后再更换账号');
-    }
-    this.store.set('account', account);
+    this.store.saveAccount(account);
     return account;
   }
-  async token(forceRefresh = false): Promise<string> {
-    const bound = this.store.getAccount();
+  async token(accountId: string, forceRefresh = false): Promise<string> {
+    return this.exclusive(() => this.acquire(accountId, forceRefresh));
+  }
+  private async acquire(accountId: string, forceRefresh: boolean): Promise<string> {
+    const bound = this.store.getAccount(accountId);
     assert(bound && this.client, 'LOGIN_REQUIRED', '请先连接 OneDrive', 401);
     try {
       const account = await this.client.getTokenCache().getAccountByHomeId(bound.id);
@@ -73,11 +79,14 @@ export class MicrosoftAuth implements AuthProvider {
       throw new AppError(503, 'TOKEN_UNAVAILABLE', '暂时无法连接微软登录服务，请稍后重试');
     }
   }
-  async clear() {
-    if (this.client) {
-      const cache = this.client.getTokenCache();
-      for (const account of await cache.getAllAccounts()) await cache.removeAccount(account);
-    }
-    this.store.clearAccount();
+  async clear(accountId: string) {
+    return this.exclusive(async () => {
+      if (this.client) {
+        const cache = this.client.getTokenCache();
+        const account = await cache.getAccountByHomeId(accountId);
+        if (account) await cache.removeAccount(account);
+      }
+      this.store.removeAccount(accountId);
+    });
   }
 }

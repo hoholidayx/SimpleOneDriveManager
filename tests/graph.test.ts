@@ -8,9 +8,9 @@ describe('Graph transport', () => {
   it('refreshes a rejected token once, without leaking it to storage uploads', async () => {
     const identity = auth();
     const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response('{}', { status: 401 })).mockResolvedValueOnce(new Response('{"id":"drive"}'));
-    const graph = new Graph(identity, randomBytes(32), fetcher);
+    const graph = new Graph(identity, randomBytes(32), fetcher).forAccount('owner');
     expect(await graph.drive()).toEqual({ id: 'drive' });
-    expect(identity.token).toHaveBeenCalledWith(true);
+    expect(identity.token).toHaveBeenCalledWith('owner', true);
     fetcher.mockResolvedValueOnce(new Response('{}'));
     await graph.storage('https://test.up.1drv.com/session/x', { method: 'PUT', body: 'bytes' });
     const options = fetcher.mock.calls[2][1]!;
@@ -20,7 +20,7 @@ describe('Graph transport', () => {
   it('honors Retry-After for reads and does not blindly retry writes', async () => {
     const wait = vi.fn(async () => undefined);
     const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response('{}', { status: 429, headers: { 'Retry-After': '2' } })).mockResolvedValueOnce(new Response('{"id":"drive"}'));
-    const graph = new Graph(auth(), randomBytes(32), fetcher, wait);
+    const graph = new Graph(auth(), randomBytes(32), fetcher, wait).forAccount('owner');
     await graph.drive(); expect(wait).toHaveBeenCalledWith(2000);
     fetcher.mockResolvedValueOnce(new Response('{}', { status: 503 }));
     await expect(graph.request('/me/drive/items/x', { method: 'DELETE' })).rejects.toMatchObject({ status: 502 });
@@ -28,7 +28,7 @@ describe('Graph transport', () => {
   });
   it('signs pagination cursors and binds them to account and directory', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({ value: [], '@odata.nextLink': 'https://graph.microsoft.com/v1.0/me/drive/items/root/children?$skiptoken=abc' }))).mockResolvedValueOnce(new Response('{"value":[]}'));
-    const graph = new Graph(auth(), randomBytes(32), fetcher);
+    const graph = new Graph(auth(), randomBytes(32), fetcher).forAccount('owner');
     const page = await graph.children('root', 'owner');
     expect(page.nextCursor).toBeTruthy();
     await expect(graph.children('root', 'another-owner', page.nextCursor)).rejects.toMatchObject({ code: 'INVALID_CURSOR' });
@@ -42,7 +42,7 @@ describe('Graph transport', () => {
   });
   it('validates every image redirect without forwarding authorization', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: 'https://test.up.1drv.com/image' } })).mockResolvedValueOnce(new Response('image'));
-    const graph = new Graph(auth(), randomBytes(32), fetcher);
+    const graph = new Graph(auth(), randomBytes(32), fetcher).forAccount('owner');
     const signal = new AbortController().signal;
     expect(await (await graph.imageStorage('https://westeurope1-mediap.svc.ms/image', true, signal)).text()).toBe('image');
     for (const [, options] of fetcher.mock.calls) { expect(new Headers(options?.headers).has('Authorization')).toBe(false); expect(options?.redirect).toBe('manual'); }
@@ -55,7 +55,7 @@ describe('Graph transport', () => {
   });
   it('bounds redirect loops and respects cancelled image requests', async () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => new Response(null, { status: 302, headers: { location: '/loop' } }));
-    const graph = new Graph(auth(), randomBytes(32), fetcher);
+    const graph = new Graph(auth(), randomBytes(32), fetcher).forAccount('owner');
     const controller = new AbortController();
     await expect(graph.imageStorage('https://test.up.1drv.com/loop', true, controller.signal)).rejects.toMatchObject({ code: 'IMAGE_REDIRECT_LIMIT' });
     expect(fetcher).toHaveBeenCalledTimes(6);

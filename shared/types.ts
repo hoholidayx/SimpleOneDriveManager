@@ -1,5 +1,5 @@
 export interface Account { id: string; name: string; username: string }
-export interface AuthStatus { configured: boolean; missing: string[]; connected: boolean; account: Account | null; csrfToken: string; redirectUri: string; origin: string; loginIssue?: string }
+export interface AuthStatus { configured: boolean; missing: string[]; connected: boolean; account: Account | null; accounts: Account[]; csrfToken: string; redirectUri: string; origin: string; loginIssue?: string }
 export interface Drive { id: string; name: string; driveType: string; quota?: { total?: number; used?: number; remaining?: number; state?: string } }
 export interface DriveItem {
   id: string; name: string; size: number; eTag?: string; lastModifiedDateTime?: string;
