@@ -13,8 +13,8 @@ npm install
 npm run setup
 # 在 .env 填写微软应用信息（见下节）
 npm run build
-npm start
-npm run status
+./manage.sh start
+./manage.sh status
 ```
 
 默认地址是 <http://localhost:3000>。如果端口已被占用，请按下方说明调整本机配置。页面和接口都由同一后台服务提供；不需要启动 Vite 才能使用。
@@ -22,12 +22,14 @@ npm run status
 未配置微软应用时可以打开配置指引，文件管理在完成授权后启用。
 
 ```sh
-npm stop
-npm run restart
-npm run status
+./manage.sh stop
+./manage.sh restart
+./manage.sh status
 ```
 
-`npm start` 使用构建产物，不自动重新构建。修改源码后执行 `npm run build && npm run restart`。
+根目录的 `manage.sh` 支持从任意工作目录调用，提供 `start`、`stop`、`exit`、`restart`、`status`、`build`、`logs` 和 `help`。`exit` 等同于停止服务；`./manage.sh logs --follow` 持续查看日志，Ctrl+C 仅退出日志查看。
+
+`start` / `restart` 在构建产物缺失时自动构建；已有产物时直接使用。修改源码后执行 `./manage.sh build && ./manage.sh restart`。首次使用先安装依赖；脚本不会自动安装软件或依赖。原有的 `npm start`、`npm stop`、`npm run restart`、`npm run status` 仍可使用。
 
 ## 配置微软 OAuth
 

@@ -16,13 +16,17 @@ async function port() {
 function fixture(portNumber: number, changeTitleOnExit = false, startDelay = 0) {
   const root = mkdtempSync(path.join(tmpdir(), 'odm-service-')); fixtures.push(root);
   mkdirSync(path.join(root, 'scripts')); mkdirSync(path.join(root, 'dist/server/server'), { recursive: true });
+  mkdirSync(path.join(root, 'dist/client'), { recursive: true });
+  writeFileSync(path.join(root, 'dist/client/index.html'), '<!doctype html><title>Service test</title>');
+  copyFileSync(path.join(process.cwd(), 'manage.sh'), path.join(root, 'manage.sh'));
   for (const name of ['setup.mjs', 'service.mjs']) copyFileSync(path.join(process.cwd(), 'scripts', name), path.join(root, 'scripts', name));
   copyFileSync(path.join(process.cwd(), '.env.example'), path.join(root, '.env.example'));
   writeFileSync(path.join(root, '.env'), `PORT=${portNumber}\nTOKEN_ENCRYPTION_KEY=test\n`);
   writeFileSync(path.join(root, 'dist/server/server/index.js'), `const http=require('node:http'); const server=http.createServer((req,res)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({ok:true,service:'simple-onedrive-manager',instanceId:process.env.ODM_INSTANCE_ID,pid:process.pid}));});process.on('SIGHUP',()=>{});process.on('SIGTERM',()=>{${changeTitleOnExit ? "process.title='odm-stopping';" : ''}server.close(()=>setTimeout(()=>process.exit(0),${changeTitleOnExit ? 500 : 0}));});setTimeout(()=>server.listen(Number(process.env.PORT),'127.0.0.1'),${startDelay});`);
   return root;
 }
-const manage = (root: string, action: string) => exec(process.execPath, [path.join(root, 'scripts/service.mjs'), action], { cwd: root, timeout: 25_000, env: { PATH: process.env.PATH } });
+// Exercise the public shell entry point from outside the project directory.
+const manage = (root: string, action: string) => exec('/bin/sh', [path.join(root, 'manage.sh'), action], { cwd: tmpdir(), timeout: 25_000, env: { PATH: process.env.PATH } });
 afterEach(async () => {
   for (const root of fixtures.splice(0)) {
     await manage(root, 'stop').catch(() => undefined);
@@ -40,7 +44,7 @@ describe('detached service management', () => {
     await manage(root, 'start');
     await manage(root, 'restart');
     expect((await manage(root, 'status')).stdout).toContain('运行正常');
-    await manage(root, 'stop');
+    await manage(root, 'exit');
     expect((await manage(root, 'status')).stdout).toContain('未运行');
   });
   it('survives launcher exit and SIGHUP, supports repeated start, restart and stop', async () => {
