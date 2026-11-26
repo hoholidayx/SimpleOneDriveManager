@@ -14,6 +14,7 @@ import { Uploads, publicTask } from './uploads.js';
 import { AppError, assert } from './errors.js';
 import { CHUNK_SIZE } from '../shared/types.js';
 import { imageMime, type ThumbnailSize } from '../shared/images.js';
+import { allowedHostnames, loginIssue, requestHostname } from './network.js';
 
 declare module 'fastify' { interface FastifyRequest { session: Session | null } }
 const string = { type: 'string', minLength: 1, maxLength: 1024 };
@@ -41,15 +42,15 @@ export async function createApp(config: Config, deps: Dependencies = {}) {
     return session;
   }
   app.addHook('onRequest', async (req, reply) => {
-    const hostname = (req.headers.host || '').replace(/:\d+$/, '');
-    assert(['localhost', '127.0.0.1', '[::1]'].includes(hostname), 'INVALID_HOST', '仅允许通过本机地址访问', 403);
+    const hostname = requestHostname(req.headers.host || '');
+    assert(hostname && allowedHostnames(config).has(hostname), 'INVALID_HOST', '请通过本机地址、局域网 IP 或配置的访问域名打开页面', 403);
     reply.header('X-Content-Type-Options', 'nosniff').header('Referrer-Policy', 'no-referrer').header('X-Frame-Options', 'DENY');
     if (config.production) reply.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
     if (!req.url.startsWith('/api/')) return;
     reply.header('Cache-Control', 'no-store');
     const route = req.url.split('?')[0];
     const isCallback = route === '/api/auth/callback';
-    assert(isCallback || req.headers['sec-fetch-site'] !== 'cross-site', 'CROSS_SITE', '请从本机管理页面发起操作', 403);
+    assert(isCallback || req.headers['sec-fetch-site'] !== 'cross-site', 'CROSS_SITE', '请从管理页面发起操作', 403);
     req.session = req.cookies.odm_session ? store.getSession(req.cookies.odm_session) : null;
     if (route === '/api/auth/status' || route === '/api/auth/login') {
       if (!req.session) req.session = setSession(reply);
@@ -63,7 +64,8 @@ export async function createApp(config: Config, deps: Dependencies = {}) {
       const expected = Buffer.from(req.session.csrf);
       assert(supplied.length === expected.length && timingSafeEqual(supplied, expected), 'INVALID_CSRF', '页面校验已失效，请刷新后重试', 403);
       const origin = req.headers.origin;
-      const allowed = new Set([config.origin, new URL(config.redirectUri).origin, ...(!config.production ? ['http://localhost:5173', 'http://127.0.0.1:5173'] : [])]);
+      const requestOrigin = new URL(`${req.protocol}://${req.headers.host}`).origin;
+      const allowed = new Set([requestOrigin, config.origin, new URL(config.redirectUri).origin, ...(!config.production ? ['http://localhost:5173', 'http://127.0.0.1:5173'] : [])]);
       assert(!origin || allowed.has(origin), 'INVALID_ORIGIN', '请求来源不正确', 403);
     }
   });
@@ -81,9 +83,13 @@ export async function createApp(config: Config, deps: Dependencies = {}) {
   app.get('/api/auth/status', async req => {
     const bound = store.getAccount();
     const connected = !!bound && req.session?.accountId === bound.id;
-    return { configured: auth.configured, missing: auth.missing, connected, account: connected ? bound : null, csrfToken: req.session!.csrf, redirectUri: config.redirectUri, origin: config.origin };
+    return { configured: auth.configured, missing: auth.missing, connected, account: connected ? bound : null, csrfToken: req.session!.csrf, redirectUri: config.redirectUri, origin: config.origin, loginIssue: auth.configured ? loginIssue(config, req.headers.host || '') : undefined };
   });
-  app.get('/api/auth/login', async (req, reply) => reply.redirect(await auth.login(req.session!)));
+  app.get('/api/auth/login', async (req, reply) => {
+    const issue = auth.configured && loginIssue(config, req.headers.host || '');
+    assert(!issue, 'CALLBACK_HOST_MISMATCH', issue || '授权地址配置不正确');
+    return reply.redirect(await auth.login(req.session!));
+  });
   app.get('/api/auth/callback', { schema: { querystring: object({ code: { type: 'string', minLength: 1, maxLength: 16_384 }, state: string, error: string, error_description: { type: 'string', maxLength: 16_384 } }, ['state']) } }, async (req, reply) => {
     const query = req.query as { code?: string; state: string; error?: string };
     if (query.error) {

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,11 @@ import { Graph } from '../server/graph.js';
 import type { AuthProvider } from '../server/auth.js';
 import { AppError } from '../server/errors.js';
 import { FakeDrive } from './fake-drive.js';
+
+vi.mock('node:os', async importOriginal => ({
+  ...await importOriginal<typeof import('node:os')>(),
+  networkInterfaces: () => ({ lan: [{ address: '192.0.2.20', family: 'IPv4', internal: false }] })
+}));
 
 let context: Awaited<ReturnType<typeof createApp>>; let store: Store; let remote: FakeDrive; let headers: Record<string, string>;
 let staticRoot: string;
@@ -23,7 +28,7 @@ beforeEach(async () => {
   const { token, session } = store.newSession('owner');
   headers = { host: 'localhost:3000', cookie: `odm_session=${token}`, 'x-csrf-token': session.csrf, origin: 'http://localhost:3000' };
   const auth: AuthProvider = { configured: true, missing: [], token: async () => 'token', login: async s => { store.saveOAuth('valid-state', s.hash, { verifier: 'verifier', nonce: 'nonce' }); return 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?state=valid-state'; }, callback: async (_code, state, s) => { if (!store.consumeOAuth(state, s.hash)) throw new AppError(400, 'INVALID_STATE', '授权校验失败'); return account; }, clear: async () => store.clearAccount() };
-  const config: Config = { root: staticRoot, port: 3000, origin: 'http://localhost:3000', redirectUri: 'http://localhost:3000/api/auth/callback', clientId: '', clientSecret: '', tenantId: 'common', encryptionKey: key, databasePath: ':memory:', production: true };
+  const config: Config = { root: staticRoot, host: '0.0.0.0', port: 3000, origin: 'http://localhost:3000', redirectUri: 'http://localhost:3000/api/auth/callback', clientId: '', clientSecret: '', tenantId: 'common', encryptionKey: key, databasePath: ':memory:', production: true };
   context = await createApp(config, { store, auth, graph: new Graph(auth, key, remote.fetch), logger: false });
 });
 afterEach(async () => { await context.app.close(); store.close(); rmSync(staticRoot, { recursive: true, force: true }); });
@@ -41,6 +46,24 @@ describe('HTTP boundaries and application flow', () => {
     expect((await context.app.inject({ method: 'POST', url: '/api/items/root/folders', payload: { name: 'test' }, headers: { ...headers, 'x-csrf-token': 'invalid' } })).statusCode).toBe(403);
     expect((await context.app.inject({ method: 'POST', url: '/api/items/root/folders', payload: { name: 'test' }, headers: { ...headers, origin: 'https://attacker.example' } })).statusCode).toBe(403);
     expect(remote.requests).toHaveLength(0);
+  });
+  it('accepts LAN access and same-origin writes while retaining authentication and CSRF', async () => {
+    const lanHeaders = { ...headers, host: '192.0.2.20:3000', origin: 'http://192.0.2.20:3000' };
+    expect((await context.app.inject({ url: '/', headers: lanHeaders })).statusCode).toBe(200);
+    expect((await context.app.inject({ url: '/api/drive', headers: { host: lanHeaders.host } })).statusCode).toBe(401);
+    const create = { method: 'POST' as const, url: '/api/items/root/folders', payload: { name: 'LAN folder' } };
+    expect((await context.app.inject({ ...create, headers: { ...lanHeaders, 'x-csrf-token': 'invalid' } })).statusCode).toBe(403);
+    expect((await context.app.inject({ ...create, headers: { ...lanHeaders, origin: 'http://attacker.example' } })).statusCode).toBe(403);
+    expect((await context.app.inject({ ...create, headers: lanHeaders })).statusCode).toBe(200);
+    expect((await context.app.inject({ url: '/health', headers: { host: '192.0.2.99:3000' } })).statusCode).toBe(403);
+  });
+  it('explains a localhost callback mismatch to a LAN browser before starting OAuth', async () => {
+    const lanHeaders = { host: '192.0.2.20:3000' };
+    const status = await context.app.inject({ url: '/api/auth/status', headers: lanHeaders });
+    expect(status.json().loginIssue).toContain('HTTPS');
+    const login = await context.app.inject({ url: '/api/auth/login', headers: lanHeaders });
+    expect(login.statusCode).toBe(400);
+    expect(login.json().error.code).toBe('CALLBACK_HOST_MISMATCH');
   });
   it('does not expose credentials or runtime files through static path aliases', async () => {
     writeFileSync(path.join(staticRoot, '.env'), 'PRIVATE_TEST_VALUE');

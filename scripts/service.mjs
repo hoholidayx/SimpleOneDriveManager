@@ -1,7 +1,8 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, openSync, closeSync, chmodSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { createServer } from 'node:net';
+import { createServer, isIP } from 'node:net';
+import { networkInterfaces } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import './setup.mjs';
@@ -13,6 +14,17 @@ const recordPath = path.join(runtime, 'service.json');
 const lockPath = path.join(runtime, 'service.lock');
 const entry = path.join(root, 'dist/server/server/index.js');
 const port = Number(process.env.PORT || 3000);
+const host = process.env.HOST === 'localhost' ? '127.0.0.1' : process.env.HOST || '0.0.0.0';
+const healthHost = host === '0.0.0.0' ? '127.0.0.1' : host === '::' ? '::1' : host;
+const urlFor = (address, portNumber) => `http://${isIP(address) === 6 ? `[${address}]` : address}:${portNumber}`;
+const healthUrl = `${urlFor(healthHost, port)}/health`;
+function addresses() {
+  const result = new Set([healthHost]);
+  if (host === '0.0.0.0' || host === '::') for (const info of Object.values(networkInterfaces()).flat()) {
+    if (info && !info.internal && !info.address.includes('%') && (host === '::' || info.family === 'IPv4')) result.add(info.address);
+  }
+  return [...result].map(address => urlFor(address, port));
+}
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 mkdirSync(runtime, { recursive: true, mode: 0o700 });
 chmodSync(runtime, 0o700);
@@ -48,22 +60,25 @@ function listeners(portNumber) {
 }
 async function health(record) {
   try {
-    const response = await fetch(`http://127.0.0.1:${record.port}/health`, { signal: AbortSignal.timeout(1500) });
+    const response = await fetch(record.healthUrl || `http://127.0.0.1:${record.port}/health`, { signal: AbortSignal.timeout(1500) });
     const data = await response.json();
     return response.ok && data.service === 'simple-onedrive-manager' && data.instanceId === record.instanceId && data.pid === record.pid;
   } catch { return false; }
 }
 async function freePort() {
+  // 部分系统允许不同网卡上的监听重叠；先核对全部监听者，防止通配地址掩盖占用。
+  const occupied = () => new Error(`端口 ${port} 已被占用，请在 .env 中修改 PORT、APP_ORIGIN 和 MS_REDIRECT_URI。本脚本不会停止占用端口的其他程序。`);
+  if (listeners(port).length) throw occupied();
   await new Promise((resolve, reject) => {
     const server = createServer();
-    server.once('error', () => reject(new Error(`端口 ${port} 已被占用，请在 .env 中修改 PORT、APP_ORIGIN 和 MS_REDIRECT_URI。本脚本不会停止占用端口的其他程序。`)));
-    server.listen(port, '127.0.0.1', () => server.close(resolve));
+    server.once('error', error => reject(error.code === 'EADDRINUSE' ? occupied() : new Error(`无法监听 ${host}:${port}（${error.code}），请确认 HOST 是本机可用地址。`)));
+    server.listen(port, host, () => server.close(resolve));
   });
 }
 async function start() {
   const old = readRecord();
   if (old && verify(old)) {
-    if (await health(old)) { console.log(`服务已运行：http://localhost:${old.port}（PID ${old.pid}）`); return; }
+    if (await health(old)) { console.log(`服务已运行：${old.urls?.[0] || `http://localhost:${old.port}`}（PID ${old.pid}）`); return; }
     throw new Error('本项目进程仍在运行，但健康检查失败。请先查看日志或执行 npm stop。');
   }
   if (!existsSync(entry)) throw new Error('尚未构建项目，请先运行 npm run build。');
@@ -81,13 +96,14 @@ async function start() {
   child.unref();
   const current = info(child.pid);
   if (!current) throw new Error(`服务未能启动，请查看 ${stderr}`);
-  const record = { pid: child.pid, port, root, entry, instanceId, launchedAt: new Date().toISOString(), processStarted: current.started, processCommand: current.command, executable: process.execPath, args: [entry], stdout, stderr };
+  const record = { pid: child.pid, host, port, healthUrl, urls: addresses(), root, entry, instanceId, launchedAt: new Date().toISOString(), processStarted: current.started, processCommand: current.command, executable: process.execPath, args: [entry], stdout, stderr };
   writeFileSync(recordPath, JSON.stringify(record, null, 2) + '\n', { mode: 0o600 });
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     if (!verify(record)) break;
-    if (await health(record) && listeners(port).includes(record.pid)) {
-      console.log(`已在后台启动：http://localhost:${port}\nPID：${record.pid}\n日志：${stdout}\n错误日志：${stderr}`);
+    const owners = listeners(port);
+    if (await health(record) && owners.includes(record.pid) && owners.every(pid => pid === record.pid)) {
+      console.log(`已在后台启动，监听 ${host}:${port}\n访问地址：\n${record.urls.join('\n')}\nPID：${record.pid}\n日志：${stdout}\n错误日志：${stderr}`);
       return;
     }
     await sleep(250);
@@ -117,13 +133,14 @@ async function status() {
   if (!record || !verify(record)) { console.log('服务未运行。'); return; }
   const healthy = await health(record);
   const listening = listeners(record.port).includes(record.pid);
-  console.log(`${healthy && listening ? '运行正常' : '运行异常'}：http://localhost:${record.port}\nPID：${record.pid}\n启动时间：${record.processStarted}\n监听端口：${listening ? '正常' : '未监听'}\n健康检查：${healthy ? '通过' : '失败'}\n日志：${record.stdout}\n错误日志：${record.stderr}`);
+  console.log(`${healthy && listening ? '运行正常' : '运行异常'}：${record.healthUrl || `http://localhost:${record.port}`}\n监听地址：${record.host || '127.0.0.1'}:${record.port}\n访问地址：\n${(record.urls || [`http://localhost:${record.port}`]).join('\n')}\nPID：${record.pid}\n启动时间：${record.processStarted}\n监听端口：${listening ? '正常' : '未监听'}\n健康检查：${healthy ? '通过' : '失败'}\n日志：${record.stdout}\n错误日志：${record.stderr}`);
   if (!healthy || !listening) process.exitCode = 1;
 }
 let locked = false;
 try {
   const action = process.argv[2];
   if (!['start', 'stop', 'restart', 'status'].includes(action)) throw new Error('用法：node scripts/service.mjs start|stop|restart|status');
+  if (['start', 'restart'].includes(action) && !isIP(host)) throw new Error('HOST 必须是监听 IP，例如 0.0.0.0 或 127.0.0.1');
   if (action !== 'status') {
     try { mkdirSync(lockPath); }
     catch {

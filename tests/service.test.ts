@@ -13,7 +13,7 @@ async function port() {
   const result = (server.address() as { port: number }).port;
   await new Promise<void>(resolve => server.close(() => resolve())); return result;
 }
-function fixture(portNumber: number, changeTitleOnExit = false, startDelay = 0) {
+function fixture(portNumber: number, changeTitleOnExit = false, startDelay = 0, host = '0.0.0.0') {
   const root = mkdtempSync(path.join(tmpdir(), 'odm-service-')); fixtures.push(root);
   mkdirSync(path.join(root, 'scripts')); mkdirSync(path.join(root, 'dist/server/server'), { recursive: true });
   mkdirSync(path.join(root, 'dist/client'), { recursive: true });
@@ -21,8 +21,8 @@ function fixture(portNumber: number, changeTitleOnExit = false, startDelay = 0) 
   copyFileSync(path.join(process.cwd(), 'manage.sh'), path.join(root, 'manage.sh'));
   for (const name of ['setup.mjs', 'service.mjs']) copyFileSync(path.join(process.cwd(), 'scripts', name), path.join(root, 'scripts', name));
   copyFileSync(path.join(process.cwd(), '.env.example'), path.join(root, '.env.example'));
-  writeFileSync(path.join(root, '.env'), `PORT=${portNumber}\nTOKEN_ENCRYPTION_KEY=test\n`);
-  writeFileSync(path.join(root, 'dist/server/server/index.js'), `const http=require('node:http'); const server=http.createServer((req,res)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({ok:true,service:'simple-onedrive-manager',instanceId:process.env.ODM_INSTANCE_ID,pid:process.pid}));});process.on('SIGHUP',()=>{});process.on('SIGTERM',()=>{${changeTitleOnExit ? "process.title='odm-stopping';" : ''}server.close(()=>setTimeout(()=>process.exit(0),${changeTitleOnExit ? 500 : 0}));});setTimeout(()=>server.listen(Number(process.env.PORT),'127.0.0.1'),${startDelay});`);
+  writeFileSync(path.join(root, '.env'), `HOST=${host}\nPORT=${portNumber}\nTOKEN_ENCRYPTION_KEY=test\n`);
+  writeFileSync(path.join(root, 'dist/server/server/index.js'), `const http=require('node:http'); const server=http.createServer((req,res)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({ok:true,service:'simple-onedrive-manager',instanceId:process.env.ODM_INSTANCE_ID,pid:process.pid}));});process.on('SIGHUP',()=>{});process.on('SIGTERM',()=>{${changeTitleOnExit ? "process.title='odm-stopping';" : ''}server.close(()=>setTimeout(()=>process.exit(0),${changeTitleOnExit ? 500 : 0}));});setTimeout(()=>server.listen(Number(process.env.PORT),process.env.HOST||'0.0.0.0'),${startDelay});`);
   return root;
 }
 // Exercise the public shell entry point from outside the project directory.
@@ -34,6 +34,14 @@ afterEach(async () => {
   }
 });
 describe('detached service management', () => {
+  it('checks an IPv6-only service using its configured listening address', async () => {
+    const root = fixture(await port(), false, 0, '::1');
+    await manage(root, 'start');
+    const record = JSON.parse(readFileSync(path.join(root, '.runtime/service.json'), 'utf8'));
+    expect(record.host).toBe('::1');
+    expect(record.healthUrl).toMatch(/^http:\/\/\[::1\]:\d+\/health$/);
+    expect((await manage(root, 'status')).stdout).toContain('运行正常');
+  });
   it('allows a cold start to finish before declaring the service unhealthy', async () => {
     const root = fixture(await port(), false, 11_000);
     await manage(root, 'start');

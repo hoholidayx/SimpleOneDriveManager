@@ -1,5 +1,6 @@
 import { loadConfig } from './config.js';
 import { createApp } from './app.js';
+import { listenUrls } from './network.js';
 
 const config = loadConfig();
 const { app } = await createApp(config, { instanceId: process.env.ODM_INSTANCE_ID });
@@ -15,8 +16,8 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) process.on(signal, async ()
   process.exit(0);
 });
 try {
-  await app.listen({ host: '127.0.0.1', port: config.port });
-  console.log(`OneDrive Manager: http://localhost:${config.port}`);
+  await app.listen({ host: config.host, port: config.port });
+  console.log(`OneDrive Manager (${config.host}:${config.port}):\n${listenUrls(config.host, config.port).join('\n')}`);
 } catch (error) {
   app.log.error(error);
   await app.close();

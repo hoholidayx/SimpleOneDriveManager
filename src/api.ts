@@ -33,3 +33,16 @@ export function formatBytes(size?: number) {
 }
 export const formatDate = (value?: string | number) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
 export const friendlyError = (error: unknown) => error instanceof Error ? error.message : '操作失败，请重试';
+
+export async function copyText(text: string) {
+  if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return; }
+  // HTTP 局域网页面不是 secure context，使用用户点击触发的复制回退。
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed'; textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  try {
+    textarea.select();
+    if (!document.execCommand('copy')) throw new Error('无法自动复制，请手动复制');
+  } finally { textarea.remove(); }
+}

@@ -2,7 +2,7 @@
 
 基于 Node 24、React 19、Vite 8、TypeScript 和 Ant Design 6 的本机 OneDrive 管理系统。后端使用 Fastify 5、MSAL Node 和 Node 内置 SQLite。
 
-适合一个人在本机管理一个国际版 OneDrive，支持个人微软账号和 Microsoft 365 工作 / 学校账号。
+运行在本机，支持本机与局域网访问，适合一个人管理一个国际版 OneDrive。支持个人微软账号和 Microsoft 365 工作 / 学校账号。
 
 ## 快速开始
 
@@ -31,6 +31,28 @@ npm run build
 
 `start` / `restart` 在构建产物缺失时自动构建；已有产物时直接使用。修改源码后执行 `./manage.sh build && ./manage.sh restart`。首次使用先安装依赖；脚本不会自动安装软件或依赖。原有的 `npm start`、`npm stop`、`npm run restart`、`npm run status` 仍可使用。
 
+## 局域网访问
+
+默认 `HOST=0.0.0.0` 监听所有 IPv4 网卡。本机继续使用 `http://localhost:3000`；同一局域网内的设备使用 `http://服务器局域网IP:端口`。启动和 `./manage.sh status` 会列出可访问的地址。`0.0.0.0` 是监听地址，不是浏览器访问地址；如需仅本机访问，将 `.env` 的 `HOST` 改为 `127.0.0.1` 后重启。也可以指定本机某个网卡 IP 进行监听。
+
+普通 HTTP 局域网地址可以访问页面与配置指引，但其他设备通过微软 OAuth 登录时需要 HTTPS。微软仅为 localhost 回调提供 HTTP 例外，远端设备的 `localhost` 指向该设备自身。不能把 `http://局域网IP/api/auth/callback` 直接登记为 Web 回调。[微软回调限制](https://learn.microsoft.com/en-us/entra/identity-platform/reply-url)
+
+其他设备登录的配置方式：
+
+1. 使用一个指向本机局域网 IP 的域名，由 HTTPS 反向代理提供浏览器信任的证书。代理转发到本服务的 HTTP 端口，并保留原始 `Host` 请求头。
+2. 统一配置页面地址和回调主机名，例如以下示意域名需替换为实际可用域名：
+
+   ```dotenv
+   HOST=0.0.0.0
+   PORT=3000
+   APP_ORIGIN=https://drive.example.com
+   MS_REDIRECT_URI=https://drive.example.com/api/auth/callback
+   ```
+
+3. 在微软应用注册中添加上述精确的 **Web** 回调，执行 `./manage.sh restart`，各设备通过配置的 HTTPS 页面地址授权同一个已绑定账号。
+
+每个浏览器的登录会话独立。本机调试可继续使用原有的 localhost HTTP 页面和回调配置。若访问主机名与配置不一致，页面会解释如何调整，并暂停该地址的授权入口。请求校验仅接受实际本机网卡地址、本机主机名和明确配置的域名；局域网文件操作仍需登录及 CSRF 校验。
+
 ## 配置微软 OAuth
 
 1. 在 [Microsoft Entra 应用注册](https://learn.microsoft.com/entra/identity-platform/quickstart-register-app) 中创建应用，支持的账户类型选择“任何组织目录中的账户和个人 Microsoft 账户”。
@@ -45,6 +67,7 @@ npm run build
 | `MS_CLIENT_ID` | 微软应用客户端 ID |
 | `MS_CLIENT_SECRET` | 微软应用客户端密钥值 |
 | `MS_TENANT_ID` | 默认 `common`；也可指定 `consumers`、`organizations` 或租户 GUID |
+| `HOST` | 默认 `0.0.0.0` 支持局域网；`127.0.0.1` 限制为仅本机，也可指定本机网卡 IP |
 | `APP_ORIGIN` | 页面返回地址，默认 `http://localhost:3000` |
 | `MS_REDIRECT_URI` | 微软 Web 回调完整地址，必须与应用注册一致 |
 | `PORT` | 后端监听端口，默认 `3000` |
@@ -81,12 +104,12 @@ npm run build
 `.env` 和 `.runtime/` 已忽略提交。
 
 - `.runtime/app.sqlite`：账号、加密 MSAL 缓存、会话及加密上传任务。文件内容直接转发至 OneDrive，不在本机做完整副本。
-- `.runtime/service.json`：PID、进程启动标识、完整启动命令、项目路径、运行实例、监听端口和日志位置。
+- `.runtime/service.json`：PID、进程启动标识、完整启动命令、项目路径、运行实例、监听 IP / 端口、健康检查地址和日志位置。
 - `.runtime/stdout.log`、`.runtime/stderr.log`：服务日志。授权码、Cookie、Authorization 等不会写入请求日志。
 
 启动脚本使用 Node 的独立会话 / 进程组，标准输入关闭、标准输出和错误重定向，并解除父进程引用。服务显式处理 `SIGHUP`；启动命令结束后服务继续运行。启动会核对 PID、端口所属进程和 `/health` 返回的实例标识。停止发送 `SIGTERM`，等待当前请求关闭；不自动强杀或按端口杀进程。
 
-停止或重启前会验证 PID 的启动时间、完整命令和入口路径。端口被其他程序占用、PID 复用或运行记录不匹配时拒绝操作。启停操作加锁，重复启动会报告已有服务。当前只监听 `127.0.0.1`，不提供登录自启、系统托管或异常自动恢复。
+停止或重启前会验证 PID 的启动时间、完整命令和入口路径。端口被其他程序占用、PID 复用或运行记录不匹配时拒绝操作。启停操作加锁，重复启动会报告已有服务。健康检查使用与记录中监听地址匹配的可达地址，不依赖当前 `.env` 的修改；默认允许局域网访问，不提供登录自启、系统托管或异常自动恢复。
 
 备份或迁移授权时，应同时保留 `.env` 的加密密钥和 `.runtime/app.sqlite`。修改密钥后旧缓存无法解密；需要恢复原密钥，或停止服务、移走旧数据库及其 `-wal` / `-shm` 文件后重新授权。不要将这些文件提交到仓库。
 
@@ -105,7 +128,7 @@ npm test
 npm run build
 ```
 
-前端代理 `/api` 和 `/health`；后端依然只监听本机。开发与生产共享本机账号缓存，因此请关闭开发进程后再运行 `npm start`。
+前端代理 `/api` 和 `/health`，前后端均使用 `HOST` 选择监听网卡。开发与生产共享本机账号缓存，因此请关闭开发进程后再运行 `npm start`。开发页面的默认返回地址仍为 `http://localhost:5173`；跨设备授权请使用前述生产构建和 HTTPS 配置。
 
 测试使用内存模拟 OneDrive，不调用真实微软账号。覆盖授权会话边界、目录 CRUD、批量部分失败、下载字节、ETag、同名处理、分片中断恢复、加密持久化和独立后台服务启停。`tests/browser-fixture.ts` 仅用于本机浏览器验收，通过显式注入内存网盘启动，与生产入口分离。
 

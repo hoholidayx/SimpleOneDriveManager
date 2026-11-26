@@ -23,7 +23,7 @@ remote.saveImage('root', '山间日落.svg', 'landscape');
 remote.saveImage('root', '没有缩略图的图片.svg', 'no-thumb', { noThumbnail: true });
 remote.saveImage('root', '手机照片.heic', 'heic', { undecodable: true });
 for (let i = 0; i < 24; i++) remote.saveImage('photos', `照片 ${String(i + 1).padStart(2, '0')} — 用于验证长文件名显示和按需加载.svg`, `photo-${i}`);
-const config: Config = { root: fileURLToPath(new URL('..', import.meta.url)), port, origin: `http://127.0.0.1:${port}`, redirectUri: `http://127.0.0.1:${port}/api/auth/callback`, clientId: '', clientSecret: '', tenantId: 'common', encryptionKey: key, databasePath: ':memory:', production: true };
+const config: Config = { root: fileURLToPath(new URL('..', import.meta.url)), host: '127.0.0.1', port, origin: `http://127.0.0.1:${port}`, redirectUri: `http://127.0.0.1:${port}/api/auth/callback`, clientId: '', clientSecret: '', tenantId: 'common', encryptionKey: key, databasePath: ':memory:', production: true };
 const { app } = await createApp(config, { store, auth, graph: new Graph(auth, key, remote.fetch), instanceId: process.env.ODM_INSTANCE_ID });
 app.addHook('onSend', async (req, reply, payload) => {
   if (req.url === '/') reply.setCookie('odm_session', token, { path: '/', httpOnly: true, sameSite: 'lax' });
